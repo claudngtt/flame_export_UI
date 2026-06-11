@@ -11,7 +11,15 @@ from helper import Project
 from config import CONFIG
 import subprocess
 
-
+class ExportHook:
+    def preExport(self, info, userData, *args, **kwargs): pass
+    def postExport(self, info, userData, *args, **kwargs): pass
+    def preExportSequence(self, info, userData, *args, **kwargs): pass
+    def postExportSequence(self, info, userData, *args, **kwargs): pass
+    def preExportAsset(self, info, userData, *args, **kwargs): pass
+    def postExportAsset(self, info, userData, *args, **kwargs): pass
+    def exportOverwriteFile(self, path, *args, **kwargs):
+        return "overwrite"
 
 class CopyWorker(QtCore.QThread):
     progress = QtCore.Signal(int, str)
@@ -386,11 +394,27 @@ def create_graded_track(track):
 
 
 
+_clipboard_text = []
 
+def _export(first_export=False, comp_update=False, edl=False, clips=None, project_path=None, export_paths=None, overwrite=None):
+    
+    global _clipboard_text
 
-def _export(first_export=False, comp_update=False, edl=False, clips=None, project_path=None, export_paths=None):
+    if first_export and clips and (export_paths or overwrite):
+        
+        if overwrite:
+            overwrite_shot_names = ['_'.join(s.split('_')[:2]) for s in overwrite]
+            colour_root = os.path.join(project_path, CONFIG['colour_from_flame'])
+            for seg in clips[:]:
+                name      = str(seg.name).strip("'").strip()
+                shot_name = '_'.join(name.split('_')[:2])
+                if shot_name in overwrite_shot_names:
+                    seq       = shot_name.split('_')[0]
+                    shot_dir  = os.path.join(colour_root, seq, shot_name)
+                    file_name = f'{shot_name}{CONFIG["first_export_suffix"]}'
+                    export_paths.append(os.path.join(shot_dir, file_name))
 
-    if first_export and clips and export_paths:
+        
         flame.messages.show_in_console(f"Export paths: {export_paths}")
         exporter    = flame.PyExporter()
         preset_path = os.path.join(
@@ -398,7 +422,7 @@ def _export(first_export=False, comp_update=False, edl=False, clips=None, projec
                 flame.PyExporter.PresetVisibility.User,
                 flame.PyExporter.PresetType.Image_Sequence
             ),
-            CONFIG['first_export_preset'] + '.xml'    # NEED TO CHANGE TO SEQ/SHOT_NAME/
+            CONFIG['first_export_preset'] + '.xml'
         )
 
         output_dir = os.path.join(project_path,CONFIG['colour_from_flame'])
@@ -408,7 +432,8 @@ def _export(first_export=False, comp_update=False, edl=False, clips=None, projec
         desktop  = flame.project.current_project.current_workspace.desktop
         tmp_reel = desktop.reel_groups[0].create_reel("tmp_export")
         exported = []
-
+        hook = ExportHook() if overwrite else None
+        
         try:
             for seg in clips:
                 name      = str(seg.name).strip("'").strip()
@@ -422,23 +447,39 @@ def _export(first_export=False, comp_update=False, edl=False, clips=None, projec
                 tmp_clip   = seg.match(tmp_reel, include_timeline_fx=False)
                 output_dir = os.path.dirname(os.path.dirname(matching_path))
                 os.makedirs(output_dir, exist_ok=True)
-                exporter.export(tmp_clip, preset_path, output_dir)
+                exporter.export(tmp_clip, preset_path, output_dir,hooks=hook)
                 exported.append(output_dir + "/" + shot_name)
-                flame.messages.show_in_console(f"Exported: {tmp_clip.name} → {output_dir}", 'info')
-
+                _clipboard_text.append(output_dir + "/" + shot_name)
+            
+            
+            QtWidgets.QApplication.clipboard().setText("\n".join(_clipboard_text))
+            if exported:
+                flame.messages.show_in_dialog(
+                    title="SHOT(s) EXPORT",
+                    message="Shots for grade exporting in the background.\nPaths:\n" + "\n".join(exported),
+                    type="info",
+                    buttons=["Ok"]
+                )
         except Exception as e:
             flame.messages.show_in_console(f"Export error: {str(e)}", 'info')
         finally:
             flame.delete(tmp_reel, confirm=False)
-            flame.messages.show_in_dialog(
-                title="SHOT(s) EXPORT",
-                message="Shots for grade exporting in the background.\nPaths:\n" + "\n".join(exported),
-                type="info",
-                buttons=["Ok"]
-            )
 
 
-    if comp_update and clips and export_paths:
+
+    if comp_update and clips and (export_paths or overwrite):
+        
+        if overwrite:
+            overwrite_shot_names = ['_'.join(s.split('_')[:2]) for s in overwrite]
+            colour_root = os.path.join(project_path, CONFIG['colour_from_flame'])
+            for seg in clips[:]:
+                name      = str(seg.name).strip("'").strip()
+                shot_name = '_'.join(name.split('_')[:2])
+                if shot_name in overwrite_shot_names:
+                    seq      = shot_name.split('_')[0]
+                    shot_dir = os.path.join(colour_root, seq, shot_name)
+                    export_paths.append(os.path.join(shot_dir, name))
+        
         flame.messages.show_in_console(f"Export paths: {export_paths}")
         exporter    = flame.PyExporter()
         preset_path = os.path.join(
@@ -455,6 +496,7 @@ def _export(first_export=False, comp_update=False, edl=False, clips=None, projec
         desktop  = flame.project.current_project.current_workspace.desktop
         tmp_reel = desktop.reel_groups[0].create_reel("tmp_export")
         exported = []
+        hook = ExportHook() if overwrite else None
 
         try:
             for seg in clips:
@@ -470,20 +512,24 @@ def _export(first_export=False, comp_update=False, edl=False, clips=None, projec
                 tmp_clip   = seg.match(tmp_reel, include_timeline_fx=False)
                 output_dir = os.path.dirname(os.path.dirname(matching_path))
                 os.makedirs(output_dir, exist_ok=True)
-                exporter.export(tmp_clip, preset_path, output_dir)
+                exporter.export(tmp_clip, preset_path, output_dir,hooks=hook)
                 exported.append(output_dir + "/" + shot_name)
-                flame.messages.show_in_console(f"Exported: {tmp_clip.name} → {output_dir}", 'info')
+                _clipboard_text.append(output_dir + "/" + shot_name)
+
+            QtWidgets.QApplication.clipboard().setText("\n".join(_clipboard_text))
+            if exported:
+                flame.messages.show_in_dialog(
+                    title="SHOT(s) EXPORT",
+                    message="Shots for grade exporting in the background.\nPaths:\n" + "\n".join(exported),
+                    type="info",
+                    buttons=["Ok"]
+                )
 
         except Exception as e:
             flame.messages.show_in_console(f"Export error: {str(e)}", 'info')
         finally:
             flame.delete(tmp_reel, confirm=False)
-            flame.messages.show_in_dialog(
-                title="COMP(s) EXPORT",
-                message="Shots for grade exporting in the background.\nPaths:\n" + "\n".join(exported),
-                type="info",
-                buttons=["Ok"]
-            )
+
 
 
     if edl and clips:
@@ -538,8 +584,11 @@ def _export(first_export=False, comp_update=False, edl=False, clips=None, projec
                 )
 
                 mov_exporter.export(tmp_seq, mov_preset_path, output_dir)
-                flame.messages.show_in_console(f"REF exported: {tmp_seq.name}", 'info')
+                _clipboard_text.append(output_dir + "/" + new_name)
 
+
+                
+                QtWidgets.QApplication.clipboard().setText("\n".join(_clipboard_text))
                 flame.messages.show_in_dialog(
                 title="EDL EXPORT",
                 message=f"Exported {new_name} EDL",
@@ -592,11 +641,12 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     label_existing.setStyleSheet("color: orange;")
     main_layout.addWidget(label_existing)
 
-    text_existing = QtWidgets.QTextEdit()
-    text_existing.setReadOnly(True)
-    text_existing.setMaximumHeight(80)
-    text_existing.setText("\n".join(existing) if existing else "None")
-    main_layout.addWidget(text_existing)
+    list_existing = QtWidgets.QListWidget()
+    list_existing.setMaximumHeight(80)
+    list_existing.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+    for shot in existing:
+        list_existing.addItem(shot)
+    main_layout.addWidget(list_existing)
 
     # --- EDL section — one block per track ---
     edl_label = QtWidgets.QLabel("Export:")
@@ -632,6 +682,13 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     if not len(comp_updates_paths) == 0:
         main_layout.addWidget(export_comp_checkbox)
 
+    overwrite_checkbox = QtWidgets.QCheckBox("Overwrite existing shots")
+    overwrite_checkbox.setChecked(False)
+
+    if existing:
+        main_layout.addWidget(overwrite_checkbox)
+    
+    
     scroll_area = QtWidgets.QScrollArea()
     scroll_area.setWidgetResizable(True)
     scroll_widget = QtWidgets.QWidget()
@@ -752,14 +809,51 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     buttons.rejected.connect(dialog.reject)
     main_layout.addWidget(buttons)
 
+    overwrite_shots = []
+
+    def on_overwrite_toggled(state):
+        if not state:
+            overwrite_shots.clear()
+            list_existing.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+            for i in range(list_existing.count()):
+                list_existing.item(i).setBackground(QtGui.QColor(0,0,0,0))
+            return
+
+        QtWidgets.QMessageBox.information(
+            dialog,
+            "Overwrite existing shots",
+            "Click on shots in the list to select them for overwrite.\nSelected shots will turn blue."
+        )
+        
+        list_existing.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+        
+        def on_selection_changed():
+            overwrite_shots.clear()
+            for item in list_existing.selectedItems():
+                item.setBackground(QtGui.QColor(0,180,0))
+                overwrite_shots.append(item.text())
+            for i in range(list_existing.count()):
+                if not list_existing.item(i).isSelected():
+                    list_existing.item(i).setBackground(QtGui.QColor(0,0,0,0))
+        
+        list_existing.itemSelectionChanged.connect(on_selection_changed)
+    
+    overwrite_checkbox.stateChanged.connect(on_overwrite_toggled)
+
+    
+    
     if dialog.exec() == QtWidgets.QDialog.Accepted:
+
+        _clipboard_text.clear()
+        QtWidgets.QApplication.clipboard().clear()
         
         if export_v0_checkbox.isChecked():
             _export(
                 first_export=True,
                 clips=first_export_item + layers_item,
                 project_path=project_path,
-                export_paths=first_export_paths
+                export_paths=first_export_paths,
+                overwrite=overwrite_shots
             )
             if open_clips_paths:
                 create_graded_open_clip(project_path, open_clips_paths)
@@ -770,7 +864,8 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
                 comp_update=True,
                 clips=comp_updates_item,
                 project_path=project_path,
-                export_paths=comp_updates_paths
+                export_paths=comp_updates_paths,
+                overwrite=overwrite_shots
             )
             if open_clips_paths:
                 create_graded_open_clip(project_path, open_clips_paths)
