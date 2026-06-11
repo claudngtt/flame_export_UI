@@ -1,5 +1,24 @@
-
-#### JUN 9th 2026
+"""
+Flame Export to Grade
+Version: 1.0.0
+Date: June 11, 2026
+Author: Henry Claud N'guetta / Harbor
+Description:
+    This script provides a custom UI action for Autodesk Flame that allows users
+    to export shots to a colour grading pipeline. Users select segments from the
+    timeline and the script handles EDL export, EXR image sequence export,
+    open clip XML authoring, comp v000 creation, and grade/comp track generation.
+Requirements:
+    - PySide6
+    - Autodesk Flame Python API
+    - helper.py (Project class)
+    - config.py (CONFIG dict)
+Usage:
+    Loaded as a Flame hook. Appears under Pipeline > Export to Grade
+    in the timeline custom UI actions.
+Changelog:
+    1.0.0 - Initial release
+"""
 
 import flame
 import sys
@@ -9,9 +28,14 @@ from PySide6 import QtWidgets, QtCore, QtGui
 import shutil
 from helper import Project
 from config import CONFIG
-import subprocess
+import time
 
 class ExportHook:
+    """
+    Flame export hook that silently overwrites existing files during export.
+    Passed to PyExporter.export() via the hooks parameter only when
+    the user has explicitly selected shots to overwrite.
+    """
     def preExport(self, info, userData, *args, **kwargs): pass
     def postExport(self, info, userData, *args, **kwargs): pass
     def preExportSequence(self, info, userData, *args, **kwargs): pass
@@ -22,13 +46,27 @@ class ExportHook:
         return "overwrite"
 
 class CopyWorker(QtCore.QThread):
+    """
+    Background thread for copying EXR files from bg_plate_L1 to comp_render_main_v000.
+    Runs in a QThread to keep the progress dialog responsive during copy.
+    Renames files on copy:
+        _bg_    → _comp_
+        _plate_ → _render_
+        _L1_    → _main_
+        _v001   → _v000
+
+    Signals:
+        progress(int, str): emitted per shot with count and status message
+        error(str):         emitted if a shot copy fails
+        finished():         emitted when all shots are done
+    """
     progress = QtCore.Signal(int, str)
     error    = QtCore.Signal(str)
     finished = QtCore.Signal()
 
     def __init__(self, to_copy):
         super().__init__()
-        self.to_copy = to_copy
+        self.to_copy = to_copy  # dict: {src_folder: dst_folder}
 
     def run(self):
         count = 0
@@ -52,8 +90,14 @@ class CopyWorker(QtCore.QThread):
             except Exception as e:
                 self.error.emit(f"{src_folder}: {str(e)}")
         self.finished.emit()
-    
+
+
+
 def check_project():
+    """
+    Validates that the current Flame project has a corresponding path on disk.
+    Returns the Project object if valid, None otherwise.
+    """
     project = Project()
 
     if not os.path.exists(project.PRJ_PATH):
@@ -67,22 +111,32 @@ def check_project():
     return project
 
 def get_tracks(project_path, segments):
-    
+    """
+    Collects unique tracks from a list of timeline segments.
+    Each segment's parent is its track — using a set deduplicates
+    tracks when multiple segments belong to the same track.
+
+    Returns:
+        set of PyTrack objects
+    """
     tracks = set()
 
     for segment in segments:
         tracks.add(segment.parent)
-        flame.messages.show_in_console(f"Track: {segment}, {segment.parent}", 'info')
-
-    for track in tracks:
-        flame.messages.show_in_console(f"Track: {str(track.name).strip(chr(39)).strip()}", 'info')
 
     return tracks
 
 def create_EDL(tracks):
+    """
+    Groups tracks by their parent sequence into a dict.
+    Used to build the EDL export UI — one group per sequence,
+    one row per track within that sequence.
 
+    Returns:
+        dict: {PySequence: [PyTrack, ...]}
+    """
     edl_to_create = {}
-    
+
     for track in tracks:
         version  = track.parent
         sequence = version.parent
@@ -91,11 +145,23 @@ def create_EDL(tracks):
     return edl_to_create
 
 def build_color_path(project_path, first_export, comp_updates, layers=None):
+    """
+    Builds export and open clip paths for all selected segments.
+    Checks colour_from_flame on disk to determine if a shot is new or already exists.
+
+    Args:
+        project_path:   absolute project root path
+        first_export:   list of segment names matching pattern_first_export (e.g. SAC_010_L1)
+        comp_updates:   list of segment names matching pattern_comp_update
+        layers:         list of segment names matching pattern_layer (L2+), optional
+
+    Returns:
+        first_export_paths:  paths for new L1 shots to export
+        comp_updates_paths:  paths for new comp update shots to export
+        open_clips_paths:    paths for which to create graded open clip XMLs
+        existing:            shot names already on disk (shown in UI, skipped by default)
+    """
     colour_root = os.path.join(project_path, CONFIG['colour_from_flame'])
-    
-    flame.messages.show_in_console(f"{layers}", 'info')
-    flame.messages.show_in_console(f"{first_export}", 'info')
-    flame.messages.show_in_console(f"{comp_updates}", 'info')
     
     first_export_paths = []
     comp_updates_paths = []
@@ -113,13 +179,13 @@ def build_color_path(project_path, first_export, comp_updates, layers=None):
 
         existing_files = [f for f in os.listdir(shot_dir) if f.startswith(file_name)] if os.path.exists(shot_dir) else []
 
+        # New shot — add to export list and queue open clip creation
         if not existing_files:
-            # New shot — add to export and create open clip
             first_export_paths.append(os.path.join(shot_dir, file_name))
             open_clips_paths.append(os.path.join(shot_dir, file_name))
         
+        # v000 already exported but no open clip exists — ask user whether to create one
         elif existing_files and not os.path.exists(clip_path):
-            # v000 exists but no open clip — ask user
             dialog = flame.messages.show_in_dialog(
                 title="Export Already Exists",
                 message=f"{file_name} already exists but no grade open clip was found.\nDo you want to create one?",
@@ -131,8 +197,8 @@ def build_color_path(project_path, first_export, comp_updates, layers=None):
                 open_clips_paths.append(os.path.join(shot_dir, file_name))
             existing.append(f"{shot_name}_v000")
 
+        # v000 and open clip both exist — skip entirely, surface in UI as existing
         else:
-            # v000 exists and open clip exists — skip
             existing.append(f"{shot_name}_v000")
 
     
@@ -164,7 +230,6 @@ def build_color_path(project_path, first_export, comp_updates, layers=None):
                 open_clips_paths.append(os.path.join(shot_dir, name))
 
         else:
-            # Version exists and open clip exists — skip
             existing.append(f"{name}")
     
     if layers:
@@ -202,12 +267,26 @@ def build_color_path(project_path, first_export, comp_updates, layers=None):
     return first_export_paths, comp_updates_paths, open_clips_paths, existing
 
 def create_grade_first_version(segments):
+    """
+    Exports a MOV reference clip (grade v000) for each segment to colour_for_flame.
+    Used by the colourist as a starting point before any grade is applied.
+    Skips shots where a _graded.mov already exists on disk.
+
+    Output path: colour_for_flame/SEQ/SHOT_NAME/SHOT_NAME_comp_render_main_v000_graded.mov
+    """
+
     project = check_project()
     if not project:
         return
 
     project_name = project.PRJ_PATH
     grade_root   = os.path.join(project_name, CONFIG['colour_for_flame'])
+
+
+    # PyExporter handles all Flame exports. preset_path points to the user-saved
+    # Movie preset that defines codec, resolution and naming.
+    # foreground=True means Flame waits for the export to finish before continuing.
+    # keep_timeline_fx_renders=False ensures we export the source frames, not cached FX.
 
     exporter    = flame.PyExporter()
     preset_path = os.path.join(
@@ -232,13 +311,14 @@ def create_grade_first_version(segments):
             output_dir     = os.path.join(grade_root, seq)
             grade_shot_dir = os.path.join(output_dir, shot_name)
             os.makedirs(output_dir, exist_ok=True)
-
-            # Check if graded v000 already exists
             existing = [f for f in os.listdir(grade_shot_dir) if f.endswith('_graded.mov')] if os.path.exists(grade_shot_dir) else []
             if existing:
                 flame.messages.show_in_console(f"Graded v000 already exists for {shot_name} — skipping", 'info')
                 continue
 
+
+            # match() creates a temporary clip from the segment in the tmp reel
+            # so we can export it without touching the original sequence
             tmp_clip = seg.match(tmp_reel, include_timeline_fx=False)
             tmp_clip.name = f'{shot_name}_comp_render_main_v000_graded'
             exporter.export(tmp_clip, preset_path, output_dir)
@@ -250,6 +330,19 @@ def create_grade_first_version(segments):
         flame.delete(tmp_reel, confirm=False)
 
 def create_graded_open_clip(project_path, export_paths):
+    """
+    Creates open clip XML files for graded shots in open_clip_dir.
+    Open clips are virtual containers that Flame uses to track versioned media —
+    the XML defines a ScanPattern so Flame can discover new graded MOVs
+    as the colourist delivers versions.
+
+    Skips clips that already have an existing .clip file.
+    Handles L2+ layers by deriving clip_name from the layer suffix in the path.
+
+    Output path: open_clip_dir/SHOT_NAME_comp_render_main.clip
+    ScanPattern:  colour_for_flame/SEQ/SHOT_NAME/CLIP_NAME_v{version}_graded.mov
+    """
+
     open_clip_dir = os.path.join(project_path, CONFIG['open_clip_dir'])
     grade_root    = os.path.join(project_path, CONFIG['colour_for_flame'])
     created       =  []
@@ -302,8 +395,21 @@ def create_graded_open_clip(project_path, export_paths):
         flame.messages.show_in_console(f"Created openclip: {clip_path}", 'info')
         created.append(f'{clip_name}_graded.clip')
 
-
 def create_graded_track(track):
+    """
+    Creates a new graded timeline track by copying the selected track to a temp reel,
+    replacing each segment's media with the corresponding graded open clip,
+    then inserting the modified clip back into the sequence on a new track.
+
+    For each segment:
+        - Looks up the open clip at open_clip_dir/SHOT_NAME_comp_render_main.clip
+        - Checks colour_for_flame/SEQ/SHOT_NAME for any graded MOVs on disk
+        - If graded MOVs exist: replaces media via smart_replace_media, renames
+          segment to include '_v<source version>_graded' and sets teal colour
+        - If no graded MOVs found: adds to missing_graded_shots, skips
+
+    Shows a dialog at the end listing any shots with missing graded media.
+    """
     
     project = check_project()
     if not project:
@@ -317,6 +423,9 @@ def create_graded_track(track):
 
     desktop  = flame.project.current_project.current_workspace.desktop
     tmp_reel = desktop.reel_groups[0].create_reel("tmp_grade")
+    
+    # copy_to_media_panel creates a standalone clip from the track in the tmp reel
+    # so we can modify its segments before inserting back into the sequence
     tmp_clip = track.copy_to_media_panel(tmp_reel)
     
     progress = QtWidgets.QProgressDialog("Generating grade timeline...", None, 0, len(list(track.segments)))
@@ -355,9 +464,9 @@ def create_graded_track(track):
                             missing_graded_shots.append(f"{shot_name}")
                             continue
                         
-                        
+                        # Import the open clip and replace the segment's media
+                        # time.sleep gives Flame time to register the import before replacing
                         open_clip = flame.import_clips(open_clip_path, tmp_reel)
-                        import time#
                         time.sleep(0.5)
                         seg.smart_replace_media(open_clip[0])
                         seg.name   = seg.name + '_v<source version>_graded'
@@ -375,7 +484,7 @@ def create_graded_track(track):
 
     progress.close()
 
-
+    # Insert the modified clip into a new track at the bottom of the version
     new_track = version.create_track(-1)
     first_seg = list(track.segments)[0]
     sequence.current_time = first_seg.record_in
@@ -394,14 +503,31 @@ def create_graded_track(track):
 
 
 
+# Module-level list that accumulates exported paths across multiple _export calls
+# within a single UI session. Cleared at the start of each accepted dialog.
 _clipboard_text = []
 
 def _export(first_export=False, comp_update=False, edl=False, clips=None, project_path=None, export_paths=None, overwrite=None):
-    
+    """
+    Handles all three export types from the UI:
+
+    first_export:  exports L1/layer EXR image sequences to colour_from_flame
+    comp_update:   exports comp update EXR sequences to colour_from_flame
+    edl:           duplicates the sequence, isolates the selected track,
+                   exports EDL + REF QuickTime to colour_from_flame_edl
+
+    overwrite:     list of shot names selected by the user to re-export.
+                   When provided, their paths are appended to export_paths
+                   and ExportHook silences Flame's built-in overwrite dialog.
+
+    All exported paths are appended to _clipboard_text and copied to the
+    system clipboard after each block so the user can paste paths immediately.
+    """
     global _clipboard_text
 
     if first_export and clips and (export_paths or overwrite):
         
+        # Build and append paths for shots the user explicitly selected to overwrite
         if overwrite:
             overwrite_shot_names = ['_'.join(s.split('_')[:2]) for s in overwrite]
             colour_root = os.path.join(project_path, CONFIG['colour_from_flame'])
@@ -432,13 +558,15 @@ def _export(first_export=False, comp_update=False, edl=False, clips=None, projec
         desktop  = flame.project.current_project.current_workspace.desktop
         tmp_reel = desktop.reel_groups[0].create_reel("tmp_export")
         exported = []
+
+        # ExportHook silences Flame's overwrite dialog — only used when overwrite is set
         hook = ExportHook() if overwrite else None
         
         try:
             for seg in clips:
                 name      = str(seg.name).strip("'").strip()
                 shot_name = '_'.join(name.split('_')[:2])
-
+                # Skip segments that don't have a matching export path
                 matching_path = next((p for p in export_paths if shot_name in p), None)
                 if not matching_path:
                     flame.messages.show_in_console(f"Skipping {shot_name} — already exists", 'info')
@@ -601,8 +729,25 @@ def _export(first_export=False, comp_update=False, edl=False, clips=None, projec
         except Exception as e:
             flame.messages.show_in_console(f"EDL export error: {str(e)}", 'info')
 
-def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_paths, existing, edl_to_create, first_export_item, comp_updates_item,open_clips_paths, layers_item):
+def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_paths, existing, edl_to_create, first_export_item, comp_updates_item, open_clips_paths, layers_item):
+    """
+    Main export dialog. Shows a summary of what will be exported and provides
+    per-track checkboxes for EDL, comp track and graded track creation.
 
+    Layout:
+        - Project path label
+        - New shots text area (first_export_paths)
+        - Comp updates text area (comp_updates_paths)
+        - Existing shots list (selectable for overwrite)
+        - Export checkboxes: Grade_v0, comp updates, overwrite
+        - Scrollable track section: one group per track with EDL/comp/grade checkboxes
+          and coloured segment pills
+        - Ok / Cancel buttons
+
+    On accept:
+        Clears clipboard, then runs selected operations in order:
+        export v0 → export comp → export EDL → create comp track → create graded track
+    """
     dialog = QtWidgets.QDialog()
     dialog.setWindowTitle("Export to Grade")
     dialog.setMinimumSize(900, 600)
@@ -688,6 +833,8 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     if existing:
         main_layout.addWidget(overwrite_checkbox)
     
+    # --- Scrollable track section ---
+    # One group per track, each showing: EDL/comp/grade checkboxes and segment colour pills
     
     scroll_area = QtWidgets.QScrollArea()
     scroll_area.setWidgetResizable(True)
@@ -695,16 +842,24 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     scroll_layout = QtWidgets.QVBoxLayout(scroll_widget)
 
 
-    edl_tracks_to_export   = []
-    graded_track_to_create = []
-    comp_track_to_create = []
+    edl_tracks_to_export   = []  # list of (track, seq_input) tuples for EDL export
+    graded_track_to_create = []  # list of tracks for graded track creation
+    comp_track_to_create   = []  # list of tracks for comp track creation
 
     for sequence, tracks in edl_to_create.items():
         seq_name = str(sequence.name).strip("'").strip()
 
+
+
+        # Detect track type from non-black segment names
+        # is_first: standard L1 shot — gets all three checkboxes ticked by default
+        # is_layer: L2+ layer — only EDL ticked
+        # is_comp:  comp update — only EDL ticked
+        
         for track in tracks:
 
             # Detect track type from segments
+            # Default EDL name: seq_name for L1, seq_name_L2 for layers, seq_name_comp for comp
             segs_names = [str(s.name).strip("'").strip() for s in track.segments 
                          if str(s.colour).strip('()').split(',')[0].strip() != '0.0']
             is_layer = any(re.match(CONFIG['pattern_layer'], n) for n in segs_names)
@@ -719,6 +874,8 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
             else:
                 default_name = seq_name
 
+
+            # Editable name field — pre-filled with default_name, user can rename before export
             group        = QtWidgets.QGroupBox()
             group_layout = QtWidgets.QVBoxLayout(group)
             seq_layout   = QtWidgets.QHBoxLayout()
@@ -732,6 +889,8 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
             create_comp_track_cb     = QtWidgets.QCheckBox("Create comp track")
             create_graded_track_cb   = QtWidgets.QCheckBox("Create graded track")
 
+
+            # Auto-tick based on track type and whether new shots are being exported
             if first_export_paths:
                 export_EDL_checkbox.setChecked(True)
                 edl_tracks_to_export.append((track, seq_input))
@@ -740,7 +899,8 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
                     comp_track_to_create.append(track)
                     create_graded_track_cb.setChecked(True)
                     graded_track_to_create.append(track)
-
+            
+            # Checkbox signals update the relevant lists on toggle
             export_EDL_checkbox.stateChanged.connect(
                 lambda state, t=track, s=seq_input:
                     edl_tracks_to_export.append((t, s)) if state else edl_tracks_to_export.remove((t, s))
@@ -760,7 +920,8 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
             seq_layout.addStretch()
             group_layout.addLayout(seq_layout)
 
-            # Row — checkbox on left, segment pills on right
+            # Segment pills — coloured labels showing each non-black segment in the track
+            # Colour is derived from the segment's timeline colour (RGB 0-1 → hex)
             row_layout      = QtWidgets.QHBoxLayout()
             seg_row        = QtWidgets.QWidget()
             seg_row_layout = QtWidgets.QHBoxLayout(seg_row)
@@ -773,8 +934,11 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
                 colour_str = str(seg.colour).strip('()')
                 r, g, b    = [float(x.strip()) for x in colour_str.split(',')]
                 
+                if not seg_name_str:
+                    continue  # skip truly empty segments with no name
+                # Use segment colour if set, fall back to neutral grey for uncoloured segments
                 if r == 0.0 and g == 0.0 and b == 0.0:
-                    continue
+                    bg_color = '#888888'
                 else:
                     bg_color = f'#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}'
 
@@ -810,7 +974,12 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     main_layout.addWidget(buttons)
 
     overwrite_shots = []
-
+    
+    
+    # --- Overwrite toggle ---
+    # When checked: informs user, enables multi-selection on list_existing,
+    # selected items turn green and are stored in overwrite_shots
+    # When unchecked: clears selection and resets item backgrounds
     def on_overwrite_toggled(state):
         if not state:
             overwrite_shots.clear()
@@ -840,7 +1009,9 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     
     overwrite_checkbox.stateChanged.connect(on_overwrite_toggled)
 
-    
+    # --- Accepted block ---
+    # Clipboard is cleared once here so all subsequent _export calls
+    # accumulate into a single clipboard entry
     
     if dialog.exec() == QtWidgets.QDialog.Accepted:
 
@@ -901,6 +1072,18 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
         flame.messages.show_in_console("Export cancelled", 'info')
         
 def export_to_grade(selection):
+    """
+    Entry point called by Flame when the user triggers Pipeline > Export to Grade.
+    
+    Sorts selected segments into four buckets by name pattern:
+        first_export:  L1 shots  (e.g. SAC_010_L1)
+        layers:        L2+ shots (e.g. SAC_010_L2)
+        comp_updates:  comp render versions (e.g. SAC_010_comp_render_main_v002)
+        wrong_naming:  anything that doesn't match — user is shown an error and blocked
+
+    Then builds colour paths, collects tracks, builds the EDL dict
+    and opens the export UI.
+    """
     
     project = check_project()
     if not project:
@@ -939,6 +1122,7 @@ def export_to_grade(selection):
             wrong_naming.append(name)
             wrong_naming_item.append(item)
 
+    # Block the user if any segments don't match the expected naming convention
     if wrong_naming:
         QtWidgets.QMessageBox.critical(
             None,
@@ -948,7 +1132,7 @@ def export_to_grade(selection):
         return
     
     
-    flame.messages.show_in_console(f"{layers}", 'info')
+    
     all_segments = first_export_item + comp_updates_item + layers_item
     first_export_paths, comp_updates_paths, open_clips_paths, existing = build_color_path(project.PRJ_PATH, first_export, comp_updates, layers)
     tracks        = get_tracks(project.PRJ_PATH, all_segments)
@@ -958,6 +1142,16 @@ def export_to_grade(selection):
 
 
 def create_visional_shots(segments):
+    """
+    Checks if the shots have been exported to server. If not it uses the Visional 
+    pipeline's export_clip hook to publish the plate from Flame to the shots directory 
+    first.
+
+    Two paths:
+        - src_folder exists on disk: queued directly for copy in to_copy
+        - src_folder missing: segment added to needs_export for Visional export first,
+          then re-checked after export completes
+    """
     project = check_project()
     if not project:
         return
@@ -1023,6 +1217,25 @@ def create_visional_shots(segments):
             flame.messages.show_in_console(f"Visional export error: {str(e)}", 'info')
 
 def create_comp_first_version(segments):
+    """
+    Creates comp_render_main_v000 by copying and renaming EXR files from bg_plate_L1.
+    This gives the comp department a v000 placeholder to work from before any renders exist.
+
+    File rename on copy:
+        _bg_    → _comp_
+        _plate_ → _render_
+        _L1_    → _main_
+        _v001   → _v000
+
+    Two paths:
+        - src_folder exists: queued for copy via CopyWorker
+        - src_folder missing: user is prompted to export via Visional pipeline first
+
+    If the user declines to export missing plates, the function returns early.
+    Skips shots where v000 already exists and is non-empty.
+    Progress is shown via QDialog + QProgressBar + CopyWorker QThread.
+    """
+
     project = check_project()
     if not project:
         return
@@ -1061,7 +1274,7 @@ def create_comp_first_version(segments):
 
         to_copy[src_folder] = dst_folder
 
-
+    # Re-check paths after Visional export — add any now-available shots to to_copy
     if clips_to_server:
         missing_names = [str(s.name).strip("'").strip() for s in clips_to_server]
         missing_str   = "\n".join(missing_names)
@@ -1110,6 +1323,8 @@ def create_comp_first_version(segments):
 
     errors = []
 
+
+    # Progress dialog with QThread — timer gives Qt 200ms to paint before copy starts
     progress_dialog = QtWidgets.QDialog()
     progress_dialog.setWindowTitle("Create Comp Version 0")
     progress_dialog.setMinimumWidth(500)
@@ -1141,7 +1356,18 @@ def create_comp_first_version(segments):
         flame.messages.show_in_console(f"Created v000 for {len(to_copy)} shot(s).", 'info')
 
 def create_comp_open_clip(segments):
-        
+        """
+        Creates open clip XML files for comp shots in the sequence pipeline directory.
+        The ScanPattern points to the comp EXR render folder so Flame can discover
+        new comp versions as they are delivered.
+
+        Output path: shots/SEQ/SEQ_sequence/conform/work/flame/pipeline/SHOT_comp_render_main.clip
+        ScanPattern:  shots/SEQ/SHOT/comp/data/render/main/
+                    alias_shots_SHOT_comp_render_main_v{version}/
+                    alias_shots_SHOT_comp_render_main_v{version}_{track}.{frame}.exr
+
+        Skips clips that already have an existing .clip file.
+        """
         project = check_project()
         if not project:
             return
@@ -1207,6 +1433,20 @@ def create_comp_open_clip(segments):
             created.append(f'{clip_name}.clip')
 
 def create_comp_track(track):
+    """
+    Creates a new comp timeline track by copying the selected track to a temp reel,
+    replacing each segment's media with the corresponding comp open clip,
+    then inserting the modified clip back into the sequence on a new track.
+
+    For each segment:
+        - Looks up the open clip at shots/SEQ/SEQ_sequence/conform/work/flame/pipeline/
+        - Checks comp_render_main_v000 directory exists and is non-empty
+        - If v000 exists: replaces media via smart_replace_media, renames segment
+          to include '_v<source version>' and sets blue colour (0.094, 0.224, 0.361)
+        - If v000 missing: adds to missing_L1, skips
+
+    If missing shots are found after the loop, user is offered to create v000 on the spot.
+    """
     
     project = check_project()
     if not project:
@@ -1307,6 +1547,10 @@ def create_comp_track(track):
     flame.delete(tmp_reel, confirm=False)
 
 def get_timeline_custom_ui_actions():
+    """
+    Registers the Export to Grade action in Flame's timeline right-click menu
+    under the Pipeline group. Requires Flame 2025 or later.
+    """
     return [
         {
             'name': 'Pipeline',
@@ -1319,4 +1563,3 @@ def get_timeline_custom_ui_actions():
             ]
         }
     ]
-
