@@ -1,7 +1,7 @@
 """
 Flame Export to Grade
-Version: 1.0.1
-Date: June 11, 2026
+Version: 1.1.0
+Date: June 12, 2026
 Author: Henry Claud N'guetta / Harbor
 Description:
     This script provides a custom UI action for Autodesk Flame that allows users
@@ -15,10 +15,15 @@ Requirements:
     - config.py (CONFIG dict)
 Usage:
     Loaded as a Flame hook. Appears under Pipeline > Export to Grade
-    in the timeline custom UI actions.
+    and Pipeline > Update Open Clip in the timeline custom UI actions.
 Changelog:
     1.0.0 - Initial release
     1.0.1 - Fixed crashing on importing comp open clips that don't exist
+    1.1.0 - Added selective segment processing for comp and graded track creation
+              (click pills in UI to select specific segments; unselected segments excluded)
+            - Added Update Open Clip action to force-refresh cached open clip media
+            - Fixed segment pills rendering for uncoloured segments (grey fallback)
+            - Segment pills are now clickable with blue border on selection
 """
 
 import flame
@@ -396,7 +401,7 @@ def create_graded_open_clip(project_path, export_paths):
         flame.messages.show_in_console(f"Created openclip: {clip_path}", 'info')
         created.append(f'{clip_name}_graded.clip')
 
-def create_graded_track(track):
+def create_graded_track(track, selected_segments=None):
     """
     Creates a new graded timeline track by copying the selected track to a temp reel,
     replacing each segment's media with the corresponding graded open clip,
@@ -446,6 +451,14 @@ def create_graded_track(track):
                 shot_name = '_'.join(name.split('_')[:2])
                 clip_name = f'{shot_name}_comp_render_main'
 
+                # If specific segments were selected, delete unselected ones from tmp_clip
+                if selected_segments and name not in selected_segments:
+                    flame.delete(seg, confirm=False)
+                    count += 1
+                    progress.setValue(count)
+                    QtWidgets.QApplication.processEvents()
+                    continue
+
                 open_clip_path       = os.path.join(open_clip_dir, f'{clip_name}.clip')
                 if os.path.exists(open_clip_path):
                     try:
@@ -488,6 +501,13 @@ def create_graded_track(track):
     # Insert the modified clip into a new track at the bottom of the version
     new_track = version.create_track(-1)
     first_seg = list(track.segments)[0]
+    if selected_segments:
+        # Find the segment object in the original track that matches the earliest selected name
+        first_seg = next(
+            (s for s in track.segments if str(s.name).strip("'").strip() in selected_segments),
+            list(track.segments)[0]
+        )
+    
     sequence.current_time = first_seg.record_in
     sequence.insert(tmp_clip, destination_track=new_track)
     flame.messages.show_in_console("Done", 'info')
@@ -846,6 +866,7 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     edl_tracks_to_export   = []  # list of (track, seq_input) tuples for EDL export
     graded_track_to_create = []  # list of tracks for graded track creation
     comp_track_to_create   = []  # list of tracks for comp track creation
+    track_selected_segs = {}
 
     for sequence, tracks in edl_to_create.items():
         seq_name = str(sequence.name).strip("'").strip()
@@ -923,6 +944,8 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
 
             # Segment pills — coloured labels showing each non-black segment in the track
             # Colour is derived from the segment's timeline colour (RGB 0-1 → hex)
+            selected_segs = set()
+            track_selected_segs[track] = selected_segs
             row_layout      = QtWidgets.QHBoxLayout()
             seg_row        = QtWidgets.QWidget()
             seg_row_layout = QtWidgets.QHBoxLayout(seg_row)
@@ -953,8 +976,38 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
                         color: white;
                         border-radius: 3px;
                         font-size: 11px;
+                        border: 2px solid transparent;
                     }}
                 """)
+                lbl.setCursor(QtCore.Qt.PointingHandCursor)
+
+                def make_toggle(label, name, bg, segs_set):
+                    def toggle(event):
+                        if name in segs_set:
+                            segs_set.discard(name)
+                            label.setStyleSheet(f"""
+                                QLabel {{
+                                    background-color: {bg};
+                                    color: white;
+                                    border-radius: 3px;
+                                    font-size: 11px;
+                                    border: 2px solid transparent;
+                                }}
+                            """)
+                        else:
+                            segs_set.add(name)
+                            label.setStyleSheet(f"""
+                                QLabel {{
+                                    background-color: {bg};
+                                    color: white;
+                                    border-radius: 3px;
+                                    font-size: 11px;
+                                    border: 2px solid #4da6ff;
+                                }}
+                            """)
+                    return toggle
+
+                lbl.mousePressEvent = make_toggle(lbl, seg_name_str, bg_color, selected_segs)
                 seg_row_layout.addWidget(lbl)
 
             seg_row_layout.addStretch()
@@ -1061,14 +1114,16 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
                 
                 create_comp_first_version(segs)
                 create_comp_open_clip(segs)
-                create_comp_track(track)
+                selected = track_selected_segs.get(track)
+                create_comp_track(track, selected_segments=selected if selected else None)
 
         if graded_track_to_create:
             if open_clips_paths:
                 create_graded_open_clip(project_path, open_clips_paths)
             create_grade_first_version(first_export_item + layers_item)
             for track in graded_track_to_create:
-                create_graded_track(track)
+                selected = track_selected_segs.get(track)
+                create_graded_track(track, selected_segments=selected if selected else None)
     else:
         flame.messages.show_in_console("Export cancelled", 'info')
         
@@ -1433,7 +1488,7 @@ def create_comp_open_clip(segments):
             flame.messages.show_in_console(f"Created openclip: {open_clip_path}", 'info')
             created.append(f'{clip_name}.clip')
 
-def create_comp_track(track):
+def create_comp_track(track,selected_segments=None):
     """
     Creates a new comp timeline track by copying the selected track to a temp reel,
     replacing each segment's media with the corresponding comp open clip,
@@ -1481,6 +1536,15 @@ def create_comp_track(track):
                 seq       = name.split('_')[0]
                 shot_name = '_'.join(name.split('_')[:2])
                 clip_name = f'{shot_name}_comp_render_main'
+
+
+                # If specific segments were selected, delete unselected ones from tmp_clip
+                if selected_segments and name not in selected_segments:
+                    flame.delete(seg, confirm=False)
+                    count += 1
+                    progress.setValue(count)
+                    QtWidgets.QApplication.processEvents()
+                    continue
 
                 open_clip_path = os.path.join(
                     project_name, 'shots',
@@ -1552,11 +1616,106 @@ def create_comp_track(track):
             create_comp_first_version(missing_segs)
     
 
-    first_seg = list(track.segments)[0]
+    if selected_segments:
+        first_seg = next(
+            (s for s in track.segments if str(s.name).strip("'").strip() in selected_segments),
+            list(track.segments)[0]
+        )
+    else:
+        first_seg = list(track.segments)[0]
+
     sequence.current_time = first_seg.record_in
     new_track = version.create_track(-1)
     sequence.insert(tmp_clip, destination_track=new_track)
     flame.delete(tmp_reel, confirm=False)
+
+
+
+def update_open_clip(selection):
+    """
+    Force-refreshes the open clip media for selected segments.
+    Useful when Flame has cached old footage after an overwrite.
+    
+    Detects clip type from file_path:
+        - path contains 'graded' → graded open clip
+        - path contains 'comp'   → comp open clip
+    
+    Imports a fresh copy of the same open clip to a tmp reel,
+    replaces the segment's media, then deletes the tmp reel.
+    """
+    project = check_project()
+    if not project:
+        return
+
+    desktop  = flame.project.current_project.current_workspace.desktop
+    tmp_reel = desktop.reel_groups[0].create_reel("tmp_update_clip")
+
+    failed  = []
+    updated = []
+
+    try:
+        for seg in selection:
+            file_path = str(seg.file_path)
+            flame.messages.show_in_console(f"file_path: {file_path}", 'info')
+
+            project_name  = project.PRJ_PATH
+            name          = str(seg.name).strip("'").strip()
+            shot_name     = '_'.join(name.split('_')[:2])
+            seq           = name.split('_')[0]
+
+            # Detect clip type from file_path and build the .clip path
+            if 'graded' in file_path:
+                clip_path = os.path.join(
+                        project_name, CONFIG['open_clip_dir'],
+                        f'{shot_name}_comp_render_main.clip'
+                    )
+            else:
+                clip_path = os.path.join(
+                        project_name, 'shots',
+                        seq, f'{seq}_sequence',
+                        'conform', 'work', 'flame', 'pipeline',
+                        f'{shot_name}_comp_render_main.clip'
+                    )
+
+
+            if not clip_path or not os.path.exists(clip_path):
+                failed.append(str(seg.name).strip("'").strip())
+                continue
+
+            fresh_clip = flame.import_clips(clip_path, tmp_reel)
+            time.sleep(0.5)
+            seg.smart_replace_media(fresh_clip[0])
+            
+            if 'graded' not in file_path:
+                seg.name + '_v<source version>'
+                seg.__setattr__('dynamic_name', True)
+            else:
+                seg.name   = seg.name + '_v<source version>_graded'
+                seg.__setattr__('dynamic_name', True)
+            
+            updated.append(str(seg.name).strip("'").strip())
+            flame.messages.show_in_console(f"Updated: {seg.name}", 'info')
+
+    except Exception as e:
+        flame.messages.show_in_console(f"Update error: {str(e)}", 'info')
+    finally:
+        flame.delete(tmp_reel, confirm=False)
+
+    if updated:
+        flame.messages.show_in_dialog(
+            title="Open Clip Updated",
+            message=f"Updated {len(updated)} segment(s):\n" + "\n".join(updated),
+            type="info",
+            buttons=["Ok"]
+        )
+    if failed:
+        flame.messages.show_in_dialog(
+            title="Update Failed",
+            message=f"Could not find open clip for:\n" + "\n".join(failed),
+            type="info",
+            buttons=["Ok"]
+        )
+
 
 def get_timeline_custom_ui_actions():
     """
@@ -1570,6 +1729,11 @@ def get_timeline_custom_ui_actions():
                 {
                     'name': 'Export to Grade',
                     'execute': export_to_grade,
+                    'minimumVersion': '2025'
+                },
+                {
+                    'name': 'Update Open Clip',
+                    'execute': update_open_clip,
                     'minimumVersion': '2025'
                 }
             ]
