@@ -1,6 +1,6 @@
 """
 Flame Export to Grade
-Version: 1.0.0
+Version: 1.0.1
 Date: June 11, 2026
 Author: Henry Claud N'guetta / Harbor
 Description:
@@ -18,6 +18,7 @@ Usage:
     in the timeline custom UI actions.
 Changelog:
     1.0.0 - Initial release
+    1.0.1 - Fixed crashing on importing comp open clips that don't exist
 """
 
 import flame
@@ -1488,7 +1489,20 @@ def create_comp_track(track):
                     f'{clip_name}.clip'
                 )
 
-                if os.path.exists(open_clip_path):
+                if not os.path.exists(open_clip_path):
+                    # Open clip missing — check if v000 exists on disk and offer to create it
+                    comp_v000_dir = os.path.join(
+                        project_name, 'shots', seq, shot_name,
+                        'comp', 'data', 'render', 'main',
+                        f'{project_alias}_shots_{shot_name}_comp_render_main_v000'
+                    )
+                    if os.path.exists(comp_v000_dir) and os.listdir(comp_v000_dir):    
+                        create_comp_open_clip([seg])
+                    else:
+                        flame.messages.show_in_console(f"Missing open clip and no v000: {shot_name}", 'info')
+                        missing_L1.append((shot_name, seg))
+
+                else:
                     try:
                         comp_v000_dir = os.path.join(
                             project_name, 'shots', seq, shot_name,
@@ -1509,15 +1523,13 @@ def create_comp_track(track):
                         import time
                         time.sleep(0.5)
                         seg.smart_replace_media(open_clip[0])
-                        seg.name = seg.name + '_v<source version>'
+                        seg.name   = seg.name + '_v<source version>'
                         seg.colour = (0.094, 0.224, 0.361)
                         seg.__setattr__('dynamic_name', True)
                         flame.messages.show_in_console(f"Replaced: {name}", 'info')
 
                     except Exception as e:
                         flame.messages.show_in_console(f"Error {name}: {str(e)}", 'info')
-                else:
-                    flame.messages.show_in_console(f"Missing: {open_clip_path}", 'info')
 
                 count += 1
                 progress.setValue(count)
