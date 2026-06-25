@@ -23,6 +23,7 @@ CONFIG = {
     'pattern_first_export': r'^[A-Za-z]{3}_\d{3}_L1$',
     'pattern_layer':        r'^[A-Za-z]{3}_\d{3}_L[2-9]\d*$',
     'pattern_comp_update':  r'^[A-Za-z]{3}_\d{3}_comp_render_main_v\d+$',
-    'pattern_outsource'  :  r'^[a-z]{3}_shots_[A-Z]{3}_\d{3}$'
+    'pattern_outsource'  :  r'^[a-z]{3}_shots_[A-Z]{3}_\d{3}$',
+    'pattern_comp_no_version': r'^[A-Za-z]{3}_\d{3}_comp_render_main$'
 
 }

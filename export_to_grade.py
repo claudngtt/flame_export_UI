@@ -1,7 +1,7 @@
 """
 Flame Export to Grade
-Version: 1.1.0
-Date: June 12, 2026
+Version: 1.2.0
+Date: June 25, 2026
 Author: Henry Claud N'guetta / Harbor
 Description:
     This script provides a custom UI action for Autodesk Flame that allows users
@@ -24,6 +24,12 @@ Changelog:
             - Added Update Open Clip action to force-refresh cached open clip media
             - Fixed segment pills rendering for uncoloured segments (grey fallback)
             - Segment pills are now clickable with blue border on selection
+    1.2.0 - Pills now support overwrite selection (green border when overwrite is active)
+            - Overwrite flow moved entirely to pill selection, removed list selection
+            - Added BFX warning dialog with session-level dont show again checkbox
+            - Added pattern_comp_no_version to detect segments missing version number
+              and auto-rename to _v001 before export
+            - Added job status button showing project name (red/grey toggle)
 """
 
 import flame
@@ -35,6 +41,13 @@ import shutil
 from helper import Project
 from config import CONFIG
 import time
+
+
+# Module-level
+
+
+_clipboard_text = []
+_bfx_warning_shown = False
 
 class ExportHook:
     """
@@ -115,6 +128,40 @@ def check_project():
         return None
 
     return project
+
+def _warn_bfx():
+    """
+    Shows a one-time warning per Flame session that BFX cannot be preserved
+    by the Python API and will need to be reapplied manually.
+    Controlled by a module-level flag that resets when Flame closes.
+    """
+    global _bfx_warning_shown
+    if _bfx_warning_shown:
+        return
+
+    dialog = QtWidgets.QDialog()
+    dialog.setWindowTitle("BFX Warning")
+    layout = QtWidgets.QVBoxLayout(dialog)
+
+    label = QtWidgets.QLabel(
+        "Warning: if any segments have a BFX, it cannot be detected\n"
+        "or preserved by the Python API.\n\n"
+        "If you have BFX on any segments, you will need to\n"
+        "reapply them manually after the graded track is created."
+    )
+    layout.addWidget(label)
+
+    dont_show_cb = QtWidgets.QCheckBox("Don't show again")
+    layout.addWidget(dont_show_cb)
+
+    buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok)
+    buttons.accepted.connect(dialog.accept)
+    layout.addWidget(buttons)
+
+    dialog.exec()
+
+    if dont_show_cb.isChecked():
+        _bfx_warning_shown = True
 
 def get_tracks(project_path, segments):
     """
@@ -417,6 +464,8 @@ def create_graded_track(track, selected_segments=None):
     Shows a dialog at the end listing any shots with missing graded media.
     """
     
+    _warn_bfx()
+
     project = check_project()
     if not project:
         return
@@ -487,6 +536,7 @@ def create_graded_track(track, selected_segments=None):
                         seg.colour = (0.0, 0.4, 0.4)
                         seg.__setattr__('dynamic_name', True)
                         flame.messages.show_in_console(f"Replaced: {name}", 'info')
+                        flame.messages.show_in_console(f"Seg type: {seg.type}", 'info')
                     except Exception as e:
                         flame.messages.show_in_console(f"Error {name}: {str(e)}", 'info')
                 else:
@@ -522,11 +572,6 @@ def create_graded_track(track, selected_segments=None):
             buttons=["Ok"]
         )
 
-
-
-# Module-level list that accumulates exported paths across multiple _export calls
-# within a single UI session. Cleared at the start of each accepted dialog.
-_clipboard_text = []
 
 def _export(first_export=False, comp_update=False, edl=False, clips=None, project_path=None, export_paths=None, overwrite=None):
     """
@@ -778,10 +823,28 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     #PROJECT_LABEL
     project = check_project()
     if project:
-        project_label = QtWidgets.QLabel(f"Project: {project.PRJ_PATH}")
-        project_label.setStyleSheet("color: gray; font-size: 11px; font-weight: bold;")
-        main_layout.addWidget(project_label)
-
+        job_button = QtWidgets.QPushButton(project.PRJ_PATH.split('/')[-1])
+        job_button.setCheckable(True)
+        job_button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        job_button.setStyleSheet("""
+        QPushButton {
+            background-color: #cc0033;
+            color: white;
+            border-radius: 8px;
+            font-size: 11px;
+            font-weight: bold;
+            border-bottom: 3px solid #880022;
+            padding: 4px 12px;
+            outline: none;
+        }
+        QPushButton:checked {
+            background-color: #444444;
+            color: #aaaaaa;
+            border-bottom: 1px solid #222222;
+            outline: none;
+        }
+        """)
+        main_layout.addWidget(job_button)
     # --- New shots ---
     label_first_exports = QtWidgets.QLabel(f"Exporting {len(first_export_paths)} new shot(s) to:")
     main_layout.addWidget(label_first_exports)
@@ -866,6 +929,7 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     edl_tracks_to_export   = []  # list of (track, seq_input) tuples for EDL export
     graded_track_to_create = []  # list of tracks for graded track creation
     comp_track_to_create   = []  # list of tracks for comp track creation
+    overwrite_shots = []
     track_selected_segs = {}
 
     for sequence, tracks in edl_to_create.items():
@@ -981,10 +1045,13 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
                 """)
                 lbl.setCursor(QtCore.Qt.PointingHandCursor)
 
-                def make_toggle(label, name, bg, segs_set):
+                def make_toggle(label, name, bg, segs_set, overwrite_shots_ref, overwrite_cb):
                     def toggle(event):
+                        shot_name = '_'.join(name.split('_')[:2])
                         if name in segs_set:
                             segs_set.discard(name)
+                            if overwrite_cb.isChecked() and shot_name in overwrite_shots_ref:
+                                overwrite_shots_ref.remove(shot_name)
                             label.setStyleSheet(f"""
                                 QLabel {{
                                     background-color: {bg};
@@ -996,18 +1063,27 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
                             """)
                         else:
                             segs_set.add(name)
+                            if overwrite_cb.isChecked():
+                                if shot_name not in overwrite_shots_ref:
+                                    overwrite_shots_ref.append(shot_name)
+                                border_color = '#00b400'
+                            else:
+                                border_color = '#4da6ff'
                             label.setStyleSheet(f"""
                                 QLabel {{
                                     background-color: {bg};
                                     color: white;
                                     border-radius: 3px;
                                     font-size: 11px;
-                                    border: 2px solid #4da6ff;
+                                    border: 2px solid {border_color};
                                 }}
                             """)
                     return toggle
 
-                lbl.mousePressEvent = make_toggle(lbl, seg_name_str, bg_color, selected_segs)
+                lbl.mousePressEvent = make_toggle(
+                    lbl, seg_name_str, bg_color, selected_segs,
+                    overwrite_shots, overwrite_checkbox
+                )
                 seg_row_layout.addWidget(lbl)
 
             seg_row_layout.addStretch()
@@ -1027,7 +1103,6 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     buttons.rejected.connect(dialog.reject)
     main_layout.addWidget(buttons)
 
-    overwrite_shots = []
     
     
     # --- Overwrite toggle ---
@@ -1037,30 +1112,25 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     def on_overwrite_toggled(state):
         if not state:
             overwrite_shots.clear()
-            list_existing.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-            for i in range(list_existing.count()):
-                list_existing.item(i).setBackground(QtGui.QColor(0,0,0,0))
-            return
+            # Deselect all pills and reset borders
+            for track, pill_labels in track_pill_labels.items():
+                segs_set = track_selected_segs.get(track, set())
+                segs_set.clear()
+                for name, lbl in pill_labels.items():
+                    colour_str = str(next(s for s in track.segments 
+                                   if str(s.name).strip("'").strip() == name).colour).strip('()')
+                    r, g, b = [float(x.strip()) for x in colour_str.split(',')]
+                    bg = '#888888' if r == 0.0 and g == 0.0 and b == 0.0 else f'#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}'
+                    lbl.setStyleSheet(f"""
+                        QLabel {{
+                            background-color: {bg};
+                            color: white;
+                            border-radius: 3px;
+                            font-size: 11px;
+                            border: 2px solid transparent;
+                        }}
+                    """)
 
-        QtWidgets.QMessageBox.information(
-            dialog,
-            "Overwrite existing shots",
-            "Click on shots in the list to select them for overwrite.\nSelected shots will turn blue."
-        )
-        
-        list_existing.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
-        
-        def on_selection_changed():
-            overwrite_shots.clear()
-            for item in list_existing.selectedItems():
-                item.setBackground(QtGui.QColor(0,180,0))
-                overwrite_shots.append(item.text())
-            for i in range(list_existing.count()):
-                if not list_existing.item(i).isSelected():
-                    list_existing.item(i).setBackground(QtGui.QColor(0,0,0,0))
-        
-        list_existing.itemSelectionChanged.connect(on_selection_changed)
-    
     overwrite_checkbox.stateChanged.connect(on_overwrite_toggled)
 
     # --- Accepted block ---
@@ -1145,15 +1215,18 @@ def export_to_grade(selection):
     if not project:
         return
 
-    wrong_naming = []
-    first_export = []
-    comp_updates = []
-    layers       = []
+    wrong_naming         = []
+    first_export         = []
+    comp_updates         = []
+    layers               = []
+    comp_no_version      = []
+    
 
-    wrong_naming_item = []
-    first_export_item = []
-    comp_updates_item = []
-    layers_item       = []
+    wrong_naming_item    = []
+    first_export_item    = []
+    comp_updates_item    = []
+    layers_item          = []
+    comp_no_version_item = []
     
 
     for item in selection:
@@ -1174,10 +1247,32 @@ def export_to_grade(selection):
             comp_updates.append(name)
             comp_updates_item.append(item)
 
+        elif re.match(CONFIG['pattern_comp_no_version'], name):
+            comp_no_version.append(name)
+            comp_no_version_item.append(item)
+
         else:
             wrong_naming.append(name)
             wrong_naming_item.append(item)
 
+    if comp_no_version:
+        no_version_str = "\n".join(comp_no_version)
+        dialog = flame.messages.show_in_dialog(
+            title="Missing Version Number",
+            message=f"The following segments are missing a version number:\n\n{no_version_str}\n\n"
+                    f"They will be renamed to add the current v number.\n"
+                    f"After export completes, please rerun Export to Grade.",
+            type="question",
+            buttons=["Rename and Export"],
+            cancel_button="Cancel"
+        )
+
+        # Rename segments in Flame and add to comp_updates
+        for seg in comp_no_version_item:
+            seg.name = str(seg.name).strip("'").strip() + '_v<source version>'
+            seg.__setattr__('dynamic_name', True)
+        return
+    
     # Block the user if any segments don't match the expected naming convention
     if wrong_naming:
         QtWidgets.QMessageBox.critical(
@@ -1186,8 +1281,6 @@ def export_to_grade(selection):
             "Please rename the following clips:\n\n\n" + "\n".join(wrong_naming) + "\n\n\nExpected format: SEQ_###_L#" + "\n\n\nExpected format: SEQ_SHOTNUMBER_comp_render_main_version"
         )
         return
-    
-    
     
     all_segments = first_export_item + comp_updates_item + layers_item
     first_export_paths, comp_updates_paths, open_clips_paths, existing = build_color_path(project.PRJ_PATH, first_export, comp_updates, layers)
@@ -1503,7 +1596,8 @@ def create_comp_track(track,selected_segments=None):
 
     If missing shots are found after the loop, user is offered to create v000 on the spot.
     """
-    
+    _warn_bfx()
+
     project = check_project()
     if not project:
         return
