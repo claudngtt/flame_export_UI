@@ -1,7 +1,7 @@
 """
 Flame Export to Grade
-Version: 1.2.0
-Date: June 25, 2026
+Version: 1.4.0
+Date: July 08, 2026
 Author: Henry Claud N'guetta / Harbor
 Description:
     This script provides a custom UI action for Autodesk Flame that allows users
@@ -14,13 +14,16 @@ Requirements:
     - helper.py (Project class)
     - config.py (CONFIG dict)
 Usage:
-    Loaded as a Flame hook. Appears under Pipeline > Export to Grade
-    and Pipeline > Update Open Clip in the timeline custom UI actions.
+    Loaded as a Flame hook. Appears under HARBOR EXPORT in the timeline
+    right-click menu with the following actions:
+        1. Export         — main export dialog
+        2. Import Latest Grade — updates open clip to latest graded comp version
+        3. Select Version — lets user pick a specific graded comp version
+        4. Refresh Clip   — force-refreshes cached open clip media
 Changelog:
     1.0.0 - Initial release
     1.0.1 - Fixed crashing on importing comp open clips that don't exist
     1.1.0 - Added selective segment processing for comp and graded track creation
-              (click pills in UI to select specific segments; unselected segments excluded)
             - Added Update Open Clip action to force-refresh cached open clip media
             - Fixed segment pills rendering for uncoloured segments (grey fallback)
             - Segment pills are now clickable with blue border on selection
@@ -28,8 +31,14 @@ Changelog:
             - Overwrite flow moved entirely to pill selection, removed list selection
             - Added BFX warning dialog with session-level dont show again checkbox
             - Added pattern_comp_no_version to detect segments missing version number
-              and auto-rename to _v001 before export
+              and auto-rename before export
             - Added job status button showing project name (red/grey toggle)
+    1.3.0 - Fixed smart_replace_media failing on segments with retime (infinite
+              handles) by saving/stripping/reapplying the Timewarp and restoring
+              handle lengths via trim_head/trim_tail
+            - Added gap/empty segment skipping in comp and graded track creation
+              to prevent hangs when a segment has empty space before it
+            - Menu actions prefixed with numbers to enforce display order
 """
 
 import flame
@@ -496,9 +505,18 @@ def create_graded_track(track, selected_segments=None):
     for v in tmp_clip.versions:
         for t in v.tracks:
             for seg in t.segments:
-                name      = str(seg.name).strip("'").strip()
+                name = str(seg.name).strip("'").strip()
+
+                # Skip gaps / empty segments — name comes through as 'None' or empty
+                if not name or name.lower() == 'none' or str(seg.type).strip("'").strip().lower() == 'gap':
+                    count += 1
+                    progress.setValue(count)
+                    QtWidgets.QApplication.processEvents()
+                    continue
+
                 shot_name = '_'.join(name.split('_')[:2])
                 clip_name = f'{shot_name}_comp_render_main'
+
 
                 # If specific segments were selected, delete unselected ones from tmp_clip
                 if selected_segments and name not in selected_segments:
@@ -531,10 +549,48 @@ def create_graded_track(track, selected_segments=None):
                         # time.sleep gives Flame time to register the import before replacing
                         open_clip = flame.import_clips(open_clip_path, tmp_reel)
                         time.sleep(0.5)
+
+                        # Detect infinite handles before strip
+                        head_inf = 'inf' in str(seg.head).lower()
+                        tail_inf = 'inf' in str(seg.tail).lower()
+                        had_infinite = head_inf or tail_inf
+
+                        orig_head = None if head_inf else int(str(seg.head))
+                        orig_tail = None if tail_inf else int(str(seg.tail))
+
+                        saved_fx = []
+                        if had_infinite:
+                            for fx in list(seg.effects):
+                                if str(fx.type) == 'Timewarp':
+                                    setup_path = f'/var/tmp/{shot_name}_timewarp_setup.timewarp_node'
+                                    fx.save_setup(setup_path)
+                                    saved_fx.append(setup_path)
+                                    flame.delete(fx, confirm=False)
+
                         seg.smart_replace_media(open_clip[0])
+
+                        for setup_path in saved_fx:
+                            new_fx = seg.create_effect('Timewarp')
+                            new_fx.load_setup(setup_path)
+
+                        # Only restore handles if this segment had infinite handles
+                        if had_infinite:
+                            if orig_tail is not None and 'inf' not in str(seg.tail).lower():
+                                tail_diff = orig_tail - int(str(seg.tail))
+                                if tail_diff != 0:
+                                    seg.trim_tail(tail_diff)
+                                    flame.messages.show_in_console(f"Trimmed tail by {tail_diff} to restore {orig_tail}", 'info')
+
+                            if orig_head is not None and 'inf' not in str(seg.head).lower():
+                                head_diff = orig_head - int(str(seg.head))
+                                if head_diff != 0:
+                                    seg.trim_head(head_diff)
+                                    flame.messages.show_in_console(f"Trimmed head by {head_diff} to restore {orig_head}", 'info')
+
                         seg.name   = seg.name + '_v<source version>_graded'
                         seg.colour = (0.0, 0.4, 0.4)
                         seg.__setattr__('dynamic_name', True)
+                        
                         flame.messages.show_in_console(f"Replaced: {name}", 'info')
                         flame.messages.show_in_console(f"Seg type: {seg.type}", 'info')
                     except Exception as e:
@@ -815,7 +871,7 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
         export v0 → export comp → export EDL → create comp track → create graded track
     """
     dialog = QtWidgets.QDialog()
-    dialog.setWindowTitle("Export to Grade")
+    dialog.setWindowTitle("HARBOR TIMELINE MANAGER")
     dialog.setMinimumSize(900, 600)
 
     main_layout = QtWidgets.QVBoxLayout(dialog)
@@ -1623,10 +1679,21 @@ def create_comp_track(track,selected_segments=None):
 
 
     count = 0
+    flame.messages.show_in_console(f"fucntion runs", 'info')
     for v in tmp_clip.versions:
+        flame.messages.show_in_console(f"{v.name}", 'info')
         for t in v.tracks:
+            flame.messages.show_in_console(f"{t.name}", 'info')
             for seg in t.segments:
-                name      = str(seg.name).strip("'").strip()
+                name = str(seg.name).strip("'").strip()
+
+                # Skip gaps / empty segments — name comes through as 'None' or empty
+                if not name or name.lower() == 'none' or str(seg.type).strip("'").strip().lower() == 'gap':
+                    count += 1
+                    progress.setValue(count)
+                    QtWidgets.QApplication.processEvents()
+                    continue
+
                 seq       = name.split('_')[0]
                 shot_name = '_'.join(name.split('_')[:2])
                 clip_name = f'{shot_name}_comp_render_main'
@@ -1634,11 +1701,13 @@ def create_comp_track(track,selected_segments=None):
 
                 # If specific segments were selected, delete unselected ones from tmp_clip
                 if selected_segments and name not in selected_segments:
+                    flame.messages.show_in_console(f"{selected_segments}", 'info')
                     flame.delete(seg, confirm=False)
                     count += 1
                     progress.setValue(count)
                     QtWidgets.QApplication.processEvents()
                     continue
+
 
                 open_clip_path = os.path.join(
                     project_name, 'shots',
@@ -1646,6 +1715,7 @@ def create_comp_track(track,selected_segments=None):
                     'conform', 'work', 'flame', 'pipeline',
                     f'{clip_name}.clip'
                 )
+                flame.messages.show_in_console(f"{selected_segments}", 'info')
 
                 if not os.path.exists(open_clip_path):
                     # Open clip missing — check if v000 exists on disk and offer to create it
@@ -1661,6 +1731,7 @@ def create_comp_track(track,selected_segments=None):
                         missing_L1.append((shot_name, seg))
 
                 else:
+                    flame.messages.show_in_console(f"2 - open clip exists", 'info')
                     try:
                         comp_v000_dir = os.path.join(
                             project_name, 'shots', seq, shot_name,
@@ -1675,16 +1746,52 @@ def create_comp_track(track,selected_segments=None):
                             progress.setValue(count)
                             QtWidgets.QApplication.processEvents()
                             continue
-
-                        # v000 exists — do the replace
+                        
+                        
                         open_clip = flame.import_clips(open_clip_path, tmp_reel)
-                        import time
                         time.sleep(0.5)
+
+                        # Detect infinite handles before strip
+                        head_inf = 'inf' in str(seg.head).lower()
+                        tail_inf = 'inf' in str(seg.tail).lower()
+                        had_infinite = head_inf or tail_inf
+
+                        orig_head = None if head_inf else int(str(seg.head))
+                        orig_tail = None if tail_inf else int(str(seg.tail))
+
+                        saved_fx = []
+                        if had_infinite:
+                            for fx in list(seg.effects):
+                                if str(fx.type) == 'Timewarp':
+                                    setup_path = f'/var/tmp/{shot_name}_timewarp_setup.timewarp_node'
+                                    fx.save_setup(setup_path)
+                                    saved_fx.append(setup_path)
+                                    flame.delete(fx, confirm=False)
+
                         seg.smart_replace_media(open_clip[0])
+
+                        for setup_path in saved_fx:
+                            new_fx = seg.create_effect('Timewarp')
+                            new_fx.load_setup(setup_path)
+
+                        # Only restore handles if this segment had infinite handles
+                        if had_infinite:
+                            if orig_tail is not None and 'inf' not in str(seg.tail).lower():
+                                tail_diff = orig_tail - int(str(seg.tail))
+                                if tail_diff != 0:
+                                    seg.trim_tail(tail_diff)
+                                    flame.messages.show_in_console(f"Trimmed tail by {tail_diff} to restore {orig_tail}", 'info')
+
+                            if orig_head is not None and 'inf' not in str(seg.head).lower():
+                                head_diff = orig_head - int(str(seg.head))
+                                if head_diff != 0:
+                                    seg.trim_head(head_diff)
+                                    flame.messages.show_in_console(f"Trimmed head by {head_diff} to restore {orig_head}", 'info')
+
+
                         seg.name   = seg.name + '_v<source version>'
                         seg.colour = (0.094, 0.224, 0.361)
                         seg.__setattr__('dynamic_name', True)
-                        flame.messages.show_in_console(f"Replaced: {name}", 'info')
 
                     except Exception as e:
                         flame.messages.show_in_console(f"Error {name}: {str(e)}", 'info')
@@ -1696,6 +1803,7 @@ def create_comp_track(track,selected_segments=None):
     progress.close()
 
     if missing_L1:
+        flame.messages.show_in_console(f"missing_L1 contents: {[(s, str(seg.name)) for s, seg in missing_L1]}", 'info')
         missing_str    = "\n".join([s for s, _ in missing_L1])
         missing_segs   = [seg for _, seg in missing_L1]
         
@@ -1818,10 +1926,10 @@ def get_timeline_custom_ui_actions():
     """
     return [
         {
-            'name': 'Pipeline',
+            'name': 'HARBOR TIMELINE TOOL',
             'actions': [
                 {
-                    'name': 'Export to Grade',
+                    'name': 'Export',
                     'execute': export_to_grade,
                     'minimumVersion': '2025'
                 },
