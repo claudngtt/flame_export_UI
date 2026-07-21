@@ -1,7 +1,7 @@
 """
 Flame Export to Grade
 Version: 1.4.0
-Date: July 08, 2026
+Date: July 21, 2026
 Author: Henry Claud N'guetta / Harbor
 Description:
     This script provides a custom UI action for Autodesk Flame that allows users
@@ -39,6 +39,18 @@ Changelog:
             - Added gap/empty segment skipping in comp and graded track creation
               to prevent hangs when a segment has empty space before it
             - Menu actions prefixed with numbers to enforce display order
+    1.4.0 - Layer (L2+) support: dedicated export presets, layer-aware clip names
+              in grade v000 export, graded open clips and graded track creation
+            - Added 'untitled' filtering so transitions no longer block export
+            - Overwrite no longer requires the export checkbox to be ticked, and
+              create_grade_first_version can now overwrite an existing v000 MOV
+            - Added per-track 'Use Open Clips' checkbox: when off, segments are
+              relinked to the latest version on disk instead of the open clip
+              wrapper, with the resolved version baked into the segment name
+            - Comp version detection no longer hardcoded to v000; scans for any
+              non-empty version folder and uses the latest
+            - Added import validation guards so a clip that resolves no media
+              is skipped rather than crashing smart_replace_media
 """
 
 import flame
@@ -328,13 +340,19 @@ def build_color_path(project_path, first_export, comp_updates, layers=None):
 
     return first_export_paths, comp_updates_paths, open_clips_paths, existing
 
-def create_grade_first_version(segments):
+def create_grade_first_version(segments, overwrite=None):
     """
     Exports a MOV reference clip (grade v000) for each segment to colour_for_flame.
     Used by the colourist as a starting point before any grade is applied.
-    Skips shots where a _graded.mov already exists on disk.
 
-    Output path: colour_for_flame/SEQ/SHOT_NAME/SHOT_NAME_comp_render_main_v000_graded.mov
+    Layers (L2+) get their own clip name and their own MOV preset, so a layer's
+    graded v000 doesn't collide with the L1 file for the same shot.
+
+    Skips shots where a _graded.mov already exists for that specific clip name.
+
+    Output path: colour_for_flame/SEQ/SHOT_NAME/CLIP_NAME_v000_graded.mov
+        L1:     HRO_010_comp_render_main_v000_graded.mov
+        Layer:  HRO_010_L2_comp_render_main_v000_graded.mov
     """
 
     project = check_project()
@@ -351,18 +369,17 @@ def create_grade_first_version(segments):
     # keep_timeline_fx_renders=False ensures we export the source frames, not cached FX.
 
     exporter    = flame.PyExporter()
-    preset_path = os.path.join(
-        exporter.get_presets_dir(
-            flame.PyExporter.PresetVisibility.User,
-            flame.PyExporter.PresetType.Movie
-        ),
-        CONFIG['first_export_preset_mov'] + '.xml'
+    presets_dir = exporter.get_presets_dir(
+        flame.PyExporter.PresetVisibility.User,
+        flame.PyExporter.PresetType.Movie
     )
     exporter.foreground               = True
     exporter.keep_timeline_fx_renders = False
 
     desktop  = flame.project.current_project.current_workspace.desktop
     tmp_reel = desktop.reel_groups[0].create_reel("tmp_grade_v000")
+    overwrite_shot_names = ['_'.join(s.split('_')[:2]) for s in overwrite] if overwrite else []
+
 
     try:
         for seg in segments:
@@ -370,21 +387,39 @@ def create_grade_first_version(segments):
             shot_name = '_'.join(name.split('_')[:2])
             seq       = name.split('_')[0]
 
+            is_layer = bool(re.match(CONFIG['pattern_layer'], name))
+            flame.messages.show_in_console(f"[gradev000] name='{name}' is_layer={is_layer}", 'info')
+
+            if is_layer:
+                layer_suffix = name.split('_')[2]
+                clip_name    = f'{shot_name}_{layer_suffix}_comp_render_main'
+                preset_path  = os.path.join(presets_dir, CONFIG['layer_export_preset_mov'] + '.xml')
+            else:
+                clip_name    = f'{shot_name}_comp_render_main'
+                preset_path  = os.path.join(presets_dir, CONFIG['first_export_preset_mov'] + '.xml')
+
             output_dir     = os.path.join(grade_root, seq)
             grade_shot_dir = os.path.join(output_dir, shot_name)
             os.makedirs(output_dir, exist_ok=True)
-            existing = [f for f in os.listdir(grade_shot_dir) if f.endswith('_graded.mov')] if os.path.exists(grade_shot_dir) else []
-            if existing:
-                flame.messages.show_in_console(f"Graded v000 already exists for {shot_name} — skipping", 'info')
+
+            flame.messages.show_in_console(f"[gradev000] clip_name={clip_name}", 'info')
+            flame.messages.show_in_console(f"[gradev000] preset={preset_path} exists={os.path.exists(preset_path)}", 'info')
+            flame.messages.show_in_console(f"[gradev000] output_dir={output_dir}", 'info')
+
+            existing = [
+                f for f in os.listdir(grade_shot_dir)
+                if f.startswith(clip_name) and f.endswith('_graded.mov')
+            ] if os.path.exists(grade_shot_dir) else []
+
+            if existing and shot_name not in overwrite_shot_names:
+                flame.messages.show_in_console(f"Graded v000 already exists for {clip_name} — skipping", 'info')
                 continue
 
-
-            # match() creates a temporary clip from the segment in the tmp reel
-            # so we can export it without touching the original sequence
+            flame.messages.show_in_console(f"[gradev000] exporting {clip_name}_v000_graded", 'info')
             tmp_clip = seg.match(tmp_reel, include_timeline_fx=False)
-            tmp_clip.name = f'{shot_name}_comp_render_main_v000_graded'
+            tmp_clip.name = f'{clip_name}_v000_graded'
             exporter.export(tmp_clip, preset_path, output_dir)
-            flame.messages.show_in_console(f"Exported grade v000: {shot_name}", 'info')
+            flame.messages.show_in_console(f"[gradev000] export call returned for {clip_name}", 'info')
 
     except Exception as e:
         flame.messages.show_in_console(f"Grade v000 export error: {str(e)}", 'info')
@@ -457,7 +492,7 @@ def create_graded_open_clip(project_path, export_paths):
         flame.messages.show_in_console(f"Created openclip: {clip_path}", 'info')
         created.append(f'{clip_name}_graded.clip')
 
-def create_graded_track(track, selected_segments=None):
+def create_graded_track(track, selected_segments=None, use_open_clips=True):
     """
     Creates a new graded timeline track by copying the selected track to a temp reel,
     replacing each segment's media with the corresponding graded open clip,
@@ -515,7 +550,13 @@ def create_graded_track(track, selected_segments=None):
                     continue
 
                 shot_name = '_'.join(name.split('_')[:2])
-                clip_name = f'{shot_name}_comp_render_main'
+
+                # Layers (L2+) have their own open clip with the layer suffix
+                if re.match(CONFIG['pattern_layer'], name):
+                    layer_suffix = name.split('_')[2]
+                    clip_name    = f'{shot_name}_{layer_suffix}_comp_render_main'
+                else:
+                    clip_name    = f'{shot_name}_comp_render_main'
 
 
                 # If specific segments were selected, delete unselected ones from tmp_clip
@@ -531,25 +572,36 @@ def create_graded_track(track, selected_segments=None):
                     try:
                         
                         
-                        # Check if any graded version exists on disk
+                        # Check that graded MOVs exist for THIS clip (layer-aware)
                         grade_root  = os.path.join(project_name, CONFIG['colour_for_flame'])
                         grade_dir   = os.path.join(grade_root, shot_name[:3], shot_name)
-                        graded_movs = [f for f in os.listdir(grade_dir)] if os.path.exists(grade_dir) else []
-                        
+                        graded_movs = [
+                            f for f in os.listdir(grade_dir)
+                            if f.startswith(clip_name) and f.endswith('.mov')
+                        ] if os.path.exists(grade_dir) else []
+
+                        flame.messages.show_in_console(f"graded_movs={graded_movs}", 'info')
 
                         if not graded_movs:
-                            flame.messages.show_in_console(f"No graded version found for {shot_name} — skipping replace", 'info')
+                            flame.messages.show_in_console(f"No graded version found for {clip_name} — skipping replace", 'info')
                             count += 1
                             progress.setValue(count)
                             QtWidgets.QApplication.processEvents()
-                            missing_graded_shots.append(f"{shot_name}")
+                            missing_graded_shots.append(clip_name)
                             continue
-                        
-                        # Import the open clip and replace the segment's media
-                        # time.sleep gives Flame time to register the import before replacing
-                        open_clip = flame.import_clips(open_clip_path, tmp_reel)
+
+                        latest_mov = sorted(graded_movs)[-1]
+
+                        if use_open_clips:
+                            import_path = open_clip_path
+                        else:
+                            import_path = os.path.join(grade_dir, latest_mov)
+                            flame.messages.show_in_console(f"Using media path: {import_path}", 'info')
+
+                        open_clip = flame.import_clips(import_path, tmp_reel)
                         time.sleep(0.5)
 
+                        
                         # Detect infinite handles before strip
                         head_inf = 'inf' in str(seg.head).lower()
                         tail_inf = 'inf' in str(seg.tail).lower()
@@ -562,7 +614,7 @@ def create_graded_track(track, selected_segments=None):
                         if had_infinite:
                             for fx in list(seg.effects):
                                 if str(fx.type) == 'Timewarp':
-                                    setup_path = f'/var/tmp/{shot_name}_timewarp_setup.timewarp_node'
+                                    setup_path = f'/var/tmp/{clip_name}_timewarp_setup.timewarp_node'
                                     fx.save_setup(setup_path)
                                     saved_fx.append(setup_path)
                                     flame.delete(fx, confirm=False)
@@ -587,9 +639,12 @@ def create_graded_track(track, selected_segments=None):
                                     seg.trim_head(head_diff)
                                     flame.messages.show_in_console(f"Trimmed head by {head_diff} to restore {orig_head}", 'info')
 
-                        seg.name   = seg.name + '_v<source version>_graded'
+                        if use_open_clips:
+                            seg.name = seg.name + '_v<source version>_graded'
+                            seg.__setattr__('dynamic_name', True)
+                        else:
+                            seg.name = os.path.splitext(latest_mov)[0]
                         seg.colour = (0.0, 0.4, 0.4)
-                        seg.__setattr__('dynamic_name', True)
                         
                         flame.messages.show_in_console(f"Replaced: {name}", 'info')
                         flame.messages.show_in_console(f"Seg type: {seg.type}", 'info')
@@ -650,6 +705,7 @@ def _export(first_export=False, comp_update=False, edl=False, clips=None, projec
     if first_export and clips and (export_paths or overwrite):
         
         # Build and append paths for shots the user explicitly selected to overwrite
+        flame.messages.show_in_console(f"[overwrite] received: {overwrite}", 'info')
         if overwrite:
             overwrite_shot_names = ['_'.join(s.split('_')[:2]) for s in overwrite]
             colour_root = os.path.join(project_path, CONFIG['colour_from_flame'])
@@ -665,15 +721,15 @@ def _export(first_export=False, comp_update=False, edl=False, clips=None, projec
         
         flame.messages.show_in_console(f"Export paths: {export_paths}")
         exporter    = flame.PyExporter()
-        preset_path = os.path.join(
-            exporter.get_presets_dir(
-                flame.PyExporter.PresetVisibility.User,
-                flame.PyExporter.PresetType.Image_Sequence
-            ),
-            CONFIG['first_export_preset'] + '.xml'
+
+        # Presets dir resolved once — the actual preset is chosen per segment
+        # inside the loop, since layers (L2+) need their own preset
+        presets_dir = exporter.get_presets_dir(
+            flame.PyExporter.PresetVisibility.User,
+            flame.PyExporter.PresetType.Image_Sequence
         )
 
-        output_dir = os.path.join(project_path,CONFIG['colour_from_flame'])
+        output_dir = os.path.join(project_path, CONFIG['colour_from_flame'])
         exporter.foreground = False
         exporter.keep_timeline_fx_renders = False
 
@@ -688,16 +744,23 @@ def _export(first_export=False, comp_update=False, edl=False, clips=None, projec
             for seg in clips:
                 name      = str(seg.name).strip("'").strip()
                 shot_name = '_'.join(name.split('_')[:2])
+
                 # Skip segments that don't have a matching export path
                 matching_path = next((p for p in export_paths if shot_name in p), None)
                 if not matching_path:
                     flame.messages.show_in_console(f"Skipping {shot_name} — already exists", 'info')
                     continue
 
+                # Layers (L2+) use their own preset so the filename keeps the layer suffix
+                if re.match(CONFIG['pattern_layer'], name):
+                    preset_path = os.path.join(presets_dir, CONFIG['layer_export_preset'] + '.xml')
+                else:
+                    preset_path = os.path.join(presets_dir, CONFIG['first_export_preset'] + '.xml')
+
                 tmp_clip   = seg.match(tmp_reel, include_timeline_fx=False)
                 output_dir = os.path.dirname(os.path.dirname(matching_path))
                 os.makedirs(output_dir, exist_ok=True)
-                exporter.export(tmp_clip, preset_path, output_dir,hooks=hook)
+                exporter.export(tmp_clip, preset_path, output_dir, hooks=hook)
                 exported.append(output_dir + "/" + shot_name)
                 _clipboard_text.append(output_dir + "/" + shot_name)
             
@@ -987,6 +1050,7 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
     comp_track_to_create   = []  # list of tracks for comp track creation
     overwrite_shots = []
     track_selected_segs = {}
+    track_use_open_clips = {}
 
     for sequence, tracks in edl_to_create.items():
         seq_name = str(sequence.name).strip("'").strip()
@@ -1030,6 +1094,12 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
             export_EDL_checkbox      = QtWidgets.QCheckBox("Export EDL")
             create_comp_track_cb     = QtWidgets.QCheckBox("Create comp track")
             create_graded_track_cb   = QtWidgets.QCheckBox("Create graded track")
+            use_open_clips_cb        = QtWidgets.QCheckBox("Use Open Clips")
+            use_open_clips_cb.setChecked(True)
+            use_open_clips_cb.setToolTip(
+                "When off, the comp/graded track is created with segments left on their "
+                "original media. Open clip XMLs are still written to disk."
+            )
 
 
             # Auto-tick based on track type and whether new shots are being exported
@@ -1059,6 +1129,7 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
             seq_layout.addWidget(export_EDL_checkbox)
             seq_layout.addWidget(create_comp_track_cb)
             seq_layout.addWidget(create_graded_track_cb)
+            seq_layout.addWidget(use_open_clips_cb)
             seq_layout.addStretch()
             group_layout.addLayout(seq_layout)
 
@@ -1066,6 +1137,7 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
             # Colour is derived from the segment's timeline colour (RGB 0-1 → hex)
             selected_segs = set()
             track_selected_segs[track] = selected_segs
+            track_use_open_clips[track] = use_open_clips_cb
             row_layout      = QtWidgets.QHBoxLayout()
             seg_row        = QtWidgets.QWidget()
             seg_row_layout = QtWidgets.QHBoxLayout(seg_row)
@@ -1122,6 +1194,7 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
                             if overwrite_cb.isChecked():
                                 if shot_name not in overwrite_shots_ref:
                                     overwrite_shots_ref.append(shot_name)
+                                    flame.messages.show_in_console(f"[overwrite] added {shot_name}, list now {overwrite_shots_ref}", 'info')
                                 border_color = '#00b400'
                             else:
                                 border_color = '#4da6ff'
@@ -1198,7 +1271,7 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
         _clipboard_text.clear()
         QtWidgets.QApplication.clipboard().clear()
         
-        if export_v0_checkbox.isChecked():
+        if export_v0_checkbox.isChecked() or overwrite_shots:
             _export(
                 first_export=True,
                 clips=first_export_item + layers_item,
@@ -1208,7 +1281,7 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
             )
             if open_clips_paths:
                 create_graded_open_clip(project_path, open_clips_paths)
-            create_grade_first_version(first_export_item + layers_item)
+            create_grade_first_version(first_export_item + layers_item, overwrite=overwrite_shots)
         
         if export_comp_checkbox.isChecked():
             _export(
@@ -1241,15 +1314,24 @@ def create_export_to_grade_UI(project_path, first_export_paths, comp_updates_pat
                 create_comp_first_version(segs)
                 create_comp_open_clip(segs)
                 selected = track_selected_segs.get(track)
-                create_comp_track(track, selected_segments=selected if selected else None)
-
+                use_clips = track_use_open_clips[track].isChecked()
+                create_comp_track(
+                    track,
+                    selected_segments=selected if selected else None,
+                    use_open_clips=use_clips
+                )
         if graded_track_to_create:
             if open_clips_paths:
                 create_graded_open_clip(project_path, open_clips_paths)
-            create_grade_first_version(first_export_item + layers_item)
+            create_grade_first_version(first_export_item + layers_item, overwrite=overwrite_shots)
             for track in graded_track_to_create:
                 selected = track_selected_segs.get(track)
-                create_graded_track(track, selected_segments=selected if selected else None)
+                use_clips = track_use_open_clips[track].isChecked()
+                create_graded_track(
+                    track,
+                    selected_segments=selected if selected else None,
+                    use_open_clips=use_clips
+                )
     else:
         flame.messages.show_in_console("Export cancelled", 'info')
         
@@ -1288,8 +1370,9 @@ def export_to_grade(selection):
     for item in selection:
         name = str(item.name).strip("'").strip()
 
-        if not name:
-            continue
+        # Skip gaps, transitions and unnamed segments
+        if not name or name.lower() in ('none', 'untitled'):
+            continue    
 
         if re.match(CONFIG['pattern_first_export'], name):
             first_export.append(name)
@@ -1637,7 +1720,7 @@ def create_comp_open_clip(segments):
             flame.messages.show_in_console(f"Created openclip: {open_clip_path}", 'info')
             created.append(f'{clip_name}.clip')
 
-def create_comp_track(track,selected_segments=None):
+def create_comp_track(track, selected_segments=None, use_open_clips=True):
     """
     Creates a new comp timeline track by copying the selected track to a temp reel,
     replacing each segment's media with the corresponding comp open clip,
@@ -1679,11 +1762,8 @@ def create_comp_track(track,selected_segments=None):
 
 
     count = 0
-    flame.messages.show_in_console(f"fucntion runs", 'info')
     for v in tmp_clip.versions:
-        flame.messages.show_in_console(f"{v.name}", 'info')
         for t in v.tracks:
-            flame.messages.show_in_console(f"{t.name}", 'info')
             for seg in t.segments:
                 name = str(seg.name).strip("'").strip()
 
@@ -1707,8 +1787,7 @@ def create_comp_track(track,selected_segments=None):
                     progress.setValue(count)
                     QtWidgets.QApplication.processEvents()
                     continue
-
-
+                
                 open_clip_path = os.path.join(
                     project_name, 'shots',
                     seq, f'{seq}_sequence',
@@ -1746,9 +1825,34 @@ def create_comp_track(track,selected_segments=None):
                             progress.setValue(count)
                             QtWidgets.QApplication.processEvents()
                             continue
-                        
-                        
-                        open_clip = flame.import_clips(open_clip_path, tmp_reel)
+
+                        comp_render_root = os.path.join(
+                            project_name, 'shots', seq, shot_name,
+                            'comp', 'data', 'render', 'main'
+                        )
+
+                        if use_open_clips:
+                            import_path = open_clip_path
+                        else:
+                            version_dirs = [
+                                d for d in os.listdir(comp_render_root)
+                                if d.startswith(f'{project_alias}_shots_{shot_name}_comp_render_main_v')
+                                and os.path.isdir(os.path.join(comp_render_root, d))
+                            ] if os.path.exists(comp_render_root) else []
+
+                            if not version_dirs:
+                                flame.messages.show_in_console(f"No comp version folders found for {shot_name} — skipping", 'info')
+                                missing_L1.append((shot_name, seg))
+                                count += 1
+                                progress.setValue(count)
+                                QtWidgets.QApplication.processEvents()
+                                continue
+
+                            latest = sorted(version_dirs)[-1]
+                            import_path = os.path.join(comp_render_root, latest)
+                            flame.messages.show_in_console(f"Using media path: {import_path}", 'info')
+
+                        open_clip = flame.import_clips(import_path, tmp_reel)
                         time.sleep(0.5)
 
                         # Detect infinite handles before strip
@@ -1763,7 +1867,7 @@ def create_comp_track(track,selected_segments=None):
                         if had_infinite:
                             for fx in list(seg.effects):
                                 if str(fx.type) == 'Timewarp':
-                                    setup_path = f'/var/tmp/{shot_name}_timewarp_setup.timewarp_node'
+                                    setup_path = f'/var/tmp/{clip_name}_timewarp_setup.timewarp_node'
                                     fx.save_setup(setup_path)
                                     saved_fx.append(setup_path)
                                     flame.delete(fx, confirm=False)
@@ -1789,9 +1893,14 @@ def create_comp_track(track,selected_segments=None):
                                     flame.messages.show_in_console(f"Trimmed head by {head_diff} to restore {orig_head}", 'info')
 
 
-                        seg.name   = seg.name + '_v<source version>'
+                        if use_open_clips:
+                            seg.name = seg.name + '_v<source version>'
+                            seg.__setattr__('dynamic_name', True)
+                        else:
+                            # latest is e.g. adt_shots_HRO_010_comp_render_main_v001
+                            version_str = latest.split('_')[-1]        # 'v001'
+                            seg.name    = f'{clip_name}_{version_str}'
                         seg.colour = (0.094, 0.224, 0.361)
-                        seg.__setattr__('dynamic_name', True)
 
                     except Exception as e:
                         flame.messages.show_in_console(f"Error {name}: {str(e)}", 'info')

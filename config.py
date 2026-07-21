@@ -11,6 +11,8 @@ CONFIG = {
     # Export preset
     'first_export_preset':         'EXPORT_TO_GRADE/SHOT_PUBLISH_FOR_GRADE',
     'first_export_preset_mov':     'EXPORT_TO_GRADE/MOV_PUBLISH_FOR_GRADE',
+    'layer_export_preset_mov':     'EXPORT_TO_GRADE/MOV_LAYER_PUBLISH_FOR_GRADE',
+    'layer_export_preset':         'EXPORT_TO_GRADE/LAYER_PUBLISH_FOR_GRADE',
     'comp_export_preset' :         'EXPORT_TO_GRADE/COMP_PUBLISH_FOR_GRADE',
     'edl_export_preset' :          'EXPORT_TO_GRADE/EDL_PUBLISH',
     'edl_ref_export_preset' :      'EXPORT_TO_GRADE/EDL_REF_PUBLISH',
