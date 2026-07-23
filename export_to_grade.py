@@ -1,7 +1,7 @@
 """
 Flame Export to Grade
-Version: 1.4.0
-Date: July 21, 2026
+Version: 1.4.1
+Date: July 23, 2026
 Author: Henry Claud N'guetta / Harbor
 Description:
     This script provides a custom UI action for Autodesk Flame that allows users
@@ -51,6 +51,14 @@ Changelog:
               non-empty version folder and uses the latest
             - Added import validation guards so a clip that resolves no media
               is skipped rather than crashing smart_replace_media
+    1.4.1 - Added Update Segment action: relinks selected segments to the latest
+              comp version folder or graded MOV on disk, bypassing the open clip
+            - Added gap/'untitled' filtering to Update Open Clip and Update Segment
+            - Made comp v000 lookup and version scan layer-aware so L2+ segments
+              no longer fall back to the L1 render
+            - Comp and graded track creation now report segments that were left
+              on their original media because the clip or version was missing,
+              including replace failures that were previously silent
 """
 
 import flame
@@ -650,8 +658,10 @@ def create_graded_track(track, selected_segments=None, use_open_clips=True):
                         flame.messages.show_in_console(f"Seg type: {seg.type}", 'info')
                     except Exception as e:
                         flame.messages.show_in_console(f"Error {name}: {str(e)}", 'info')
+                        missing_graded_shots.append(f"{clip_name} (replace failed: {str(e)[:60]})")
                 else:
                     flame.messages.show_in_console(f"Missing: {open_clip_path}", 'info')
+                    missing_graded_shots.append(f"{clip_name} (no open clip)")
 
                 count += 1
                 progress.setValue(count)
@@ -677,9 +687,10 @@ def create_graded_track(track, selected_segments=None, use_open_clips=True):
     if missing_graded_shots:
         missing_str = "\n".join(missing_graded_shots)
         flame.messages.show_in_dialog(
-            title="Missing graded movs",
-            message=f"Missing graded shots:\n{missing_str}",
-            type="info",
+            title="Graded track — segments not replaced",
+            message=f"The graded track was created, but these segments were left on "
+                    f"their original media:\n\n{missing_str}",
+            type="warning",
             buttons=["Ok"]
         )
 
@@ -1776,7 +1787,14 @@ def create_comp_track(track, selected_segments=None, use_open_clips=True):
 
                 seq       = name.split('_')[0]
                 shot_name = '_'.join(name.split('_')[:2])
-                clip_name = f'{shot_name}_comp_render_main'
+
+                # Layers (L2+) have their own open clip with the layer suffix
+                if re.match(CONFIG['pattern_layer'], name):
+                    layer_suffix = name.split('_')[2]
+                    clip_name    = f'{shot_name}_{layer_suffix}_comp_render_main'
+                else:
+                    clip_name    = f'{shot_name}_comp_render_main'
+                
 
 
                 # If specific segments were selected, delete unselected ones from tmp_clip
@@ -1807,8 +1825,7 @@ def create_comp_track(track, selected_segments=None, use_open_clips=True):
                         create_comp_open_clip([seg])
                     else:
                         flame.messages.show_in_console(f"Missing open clip and no v000: {shot_name}", 'info')
-                        missing_L1.append((shot_name, seg))
-
+                        missing_L1.append((f"{shot_name} (no open clip, no v000)", seg))
                 else:
                     flame.messages.show_in_console(f"2 - open clip exists", 'info')
                     try:
@@ -1820,7 +1837,7 @@ def create_comp_track(track, selected_segments=None, use_open_clips=True):
 
                         if not os.path.exists(comp_v000_dir) or not os.listdir(comp_v000_dir):
                             flame.messages.show_in_console(f"No comp v000 found for {shot_name} — skipping", 'info')
-                            missing_L1.append((shot_name, seg))
+                            missing_L1.append((f"{shot_name} (no comp v000)", seg))
                             count += 1
                             progress.setValue(count)
                             QtWidgets.QApplication.processEvents()
@@ -1842,7 +1859,7 @@ def create_comp_track(track, selected_segments=None, use_open_clips=True):
 
                             if not version_dirs:
                                 flame.messages.show_in_console(f"No comp version folders found for {shot_name} — skipping", 'info')
-                                missing_L1.append((shot_name, seg))
+                                missing_L1.append((f"{shot_name} (no comp version on disk)", seg))
                                 count += 1
                                 progress.setValue(count)
                                 QtWidgets.QApplication.processEvents()
@@ -1904,6 +1921,7 @@ def create_comp_track(track, selected_segments=None, use_open_clips=True):
 
                     except Exception as e:
                         flame.messages.show_in_console(f"Error {name}: {str(e)}", 'info')
+                        missing_L1.append((f"{shot_name} (replace failed)", seg))
 
                 count += 1
                 progress.setValue(count)
@@ -1912,13 +1930,14 @@ def create_comp_track(track, selected_segments=None, use_open_clips=True):
     progress.close()
 
     if missing_L1:
-        flame.messages.show_in_console(f"missing_L1 contents: {[(s, str(seg.name)) for s, seg in missing_L1]}", 'info')
-        missing_str    = "\n".join([s for s, _ in missing_L1])
-        missing_segs   = [seg for _, seg in missing_L1]
-        
+        missing_str  = "\n".join([s for s, _ in missing_L1])
+        missing_segs = [seg for _, seg in missing_L1]
+
         dialog = flame.messages.show_in_dialog(
-            title="Missing comp v000",
-            message=f"No comp v000 found for:\n{missing_str}\n\nDo you want to create it now?",
+            title="Comp track — segments not replaced",
+            message=f"The comp track was created, but these segments were left on "
+                    f"their original media:\n\n{missing_str}\n\n"
+                    f"Do you want to create comp v000 for them now?",
             type="question",
             buttons=["Create v000"],
             cancel_button="Skip"
@@ -1966,6 +1985,11 @@ def update_open_clip(selection):
 
     try:
         for seg in selection:
+            name = str(seg.name).strip("'").strip()
+            # Skip gaps, transitions and unnamed segments
+            if not name or name.lower() in ('none', 'untitled'):
+                continue
+            
             file_path = str(seg.file_path)
             flame.messages.show_in_console(f"file_path: {file_path}", 'info')
 
@@ -1998,7 +2022,7 @@ def update_open_clip(selection):
             seg.smart_replace_media(fresh_clip[0])
             
             if 'graded' not in file_path:
-                seg.name + '_v<source version>'
+                seg.name = seg.name + '_v<source version>'
                 seg.__setattr__('dynamic_name', True)
             else:
                 seg.name   = seg.name + '_v<source version>_graded'
@@ -2027,6 +2051,124 @@ def update_open_clip(selection):
             buttons=["Ok"]
         )
 
+def update_segment(selection):
+    """
+    Replaces the selected segments with the latest comp version or graded MOV
+    on disk directly (not via the open clip wrapper).
+
+    Detects clip type from file_path:
+        - path contains 'graded' → latest graded MOV in colour_for_flame
+        - otherwise              → latest comp version folder in shots render dir
+
+    The resolved version is baked into the segment name (no dynamic_name),
+    since the segment is relinked to a fixed media path rather than an open clip.
+    """
+    project = check_project()
+    if not project:
+        return
+
+    project_name  = project.PRJ_PATH
+    project_alias = project.alias
+
+    desktop  = flame.project.current_project.current_workspace.desktop
+    tmp_reel = desktop.reel_groups[0].create_reel("tmp_update_segment")
+
+    failed  = []
+    updated = []
+
+    try:
+        for seg in selection:
+            name = str(seg.name).strip("'").strip()
+
+            # Skip gaps, transitions and unnamed segments
+            if not name or name.lower() in ('none', 'untitled'):
+                continue
+
+            file_path = str(seg.file_path)
+            shot_name = '_'.join(name.split('_')[:2])
+            seq       = name.split('_')[0]
+
+            # Layer-aware clip name
+            if re.match(CONFIG['pattern_layer'], name):
+                layer_suffix = name.split('_')[2]
+                clip_name    = f'{shot_name}_{layer_suffix}_comp_render_main'
+            else:
+                clip_name    = f'{shot_name}_comp_render_main'
+
+            import_path = None
+            new_name    = None
+
+            if 'graded' in file_path:
+                # Latest graded MOV for this clip
+                grade_root = os.path.join(project_name, CONFIG['colour_for_flame'])
+                grade_dir  = os.path.join(grade_root, shot_name[:3], shot_name)
+                graded_movs = [
+                    f for f in os.listdir(grade_dir)
+                    if f.startswith(clip_name) and f.endswith('.mov')
+                ] if os.path.exists(grade_dir) else []
+
+                if not graded_movs:
+                    failed.append(f"{name} (no graded MOV)")
+                    continue
+
+                latest_mov  = sorted(graded_movs)[-1]
+                import_path = os.path.join(grade_dir, latest_mov)
+                new_name    = os.path.splitext(latest_mov)[0]
+
+            else:
+                # Latest comp version folder for this shot
+                comp_render_root = os.path.join(
+                    project_name, 'shots', seq, shot_name,
+                    'comp', 'data', 'render', 'main'
+                )
+                version_dirs = [
+                    d for d in os.listdir(comp_render_root)
+                    if d.startswith(f'{project_alias}_shots_{shot_name}_comp_render_main_v')
+                    and os.path.isdir(os.path.join(comp_render_root, d))
+                    and os.listdir(os.path.join(comp_render_root, d))
+                ] if os.path.exists(comp_render_root) else []
+
+                if not version_dirs:
+                    failed.append(f"{name} (no comp version)")
+                    continue
+
+                latest      = sorted(version_dirs)[-1]
+                import_path = os.path.join(comp_render_root, latest)
+                version_str = latest.split('_')[-1]          # e.g. 'v001'
+                new_name    = f'{clip_name}_{version_str}'
+
+            fresh_clip = flame.import_clips(import_path, tmp_reel)
+            time.sleep(0.5)
+
+            if not fresh_clip:
+                failed.append(f"{name} (import returned nothing)")
+                continue
+
+            seg.smart_replace_media(fresh_clip[0])
+            seg.name = new_name
+
+            updated.append(new_name)
+            flame.messages.show_in_console(f"Updated segment: {new_name}", 'info')
+
+    except Exception as e:
+        flame.messages.show_in_console(f"Update segment error: {str(e)}", 'info')
+    finally:
+        flame.delete(tmp_reel, confirm=False)
+
+    if updated:
+        flame.messages.show_in_dialog(
+            title="Segment Updated",
+            message=f"Updated {len(updated)} segment(s):\n" + "\n".join(updated),
+            type="info",
+            buttons=["Ok"]
+        )
+    if failed:
+        flame.messages.show_in_dialog(
+            title="Update Failed",
+            message=f"Could not update:\n" + "\n".join(failed),
+            type="info",
+            buttons=["Ok"]
+        )
 
 def get_timeline_custom_ui_actions():
     """
@@ -2045,6 +2187,11 @@ def get_timeline_custom_ui_actions():
                 {
                     'name': 'Update Open Clip',
                     'execute': update_open_clip,
+                    'minimumVersion': '2025'
+                },
+                {
+                    'name': 'Update Segment',
+                    'execute': update_segment,
                     'minimumVersion': '2025'
                 }
             ]
